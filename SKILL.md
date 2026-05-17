@@ -1,27 +1,27 @@
 ---
 name: usage2
-description: Give the agent visibility into its own token consumption. Reads Claude Code's per-message `usage` blocks straight from the session transcript JSONL — authoritative input/output/cache token counts for the main thread AND every subagent (Task) dispatch — and supports `mark`/`since` checkpoints for A/B comparisons ("did this approach burn fewer tokens than that one?"). Falls back to the built-in `/usage` panel (via a tmux scrape) for rolling-window quota state. Use when the user says "/usage2", "how many tokens", "token cost of X", "compare token usage", "am I being efficient", "what's my quota", "how close to the limit", "subagent cost", "which subagent burned the most", or whenever the agent needs to reason about its own token efficiency or session budget.
+description: For Claude Code SUBSCRIPTION users (Pro / Max 5x / Max 20x) — give the agent visibility into its own token consumption with API-equivalent dollar cost, % of session/week quota, and per-subagent attribution. Reads Claude Code's per-message `usage` blocks from the session transcript JSONL. Captures the built-in `/usage` panel via tmux for rolling 5h/7d/Sonnet-only quota percentages. Includes a passive calibration that learns your tier's tokens-per-percent from real samples. Use when the user says "/usage2", "how many tokens", "token cost", "compare token usage", "am I being efficient", "what's my quota", "how close to the limit", "subagent cost", "which subagent burned the most", or whenever the agent needs to reason about session/week budget, model efficiency, or A/B token comparisons.
 allowed-tools: Bash
 ---
 
 # /usage2
 
-Two capabilities in one skill:
+For **Claude subscription users** (Pro / Max 5x / Max 20x). The dollar figures are *API-equivalent* (what you would have paid on metered API). You actually pay the flat subscription fee.
 
-1. **Token meter** (fast, ~10ms) — reads the local session transcript JSONL and reports authoritative per-action token consumption: main-thread turns, subagent dispatches, cache hit ratios, A/B deltas.
-2. **Quota panel** (slow, ~12s) — captures Claude Code's built-in `/usage` panel via tmux to surface the rolling 5h / 7d / Sonnet-only meters with reset times.
+Three capabilities in one skill:
 
-## When to use which
+1. **Token meter** (~10ms) — reads the session transcript JSONL and reports authoritative per-action token consumption, API-equivalent dollar cost, cache breakdown, per-subagent attribution.
+2. **Quota panel** (~12s, cached for 10 min) — captures Claude Code's built-in `/usage` panel via tmux for rolling 5h / 7d / Sonnet-only meters with reset times.
+3. **Calibration** — learns your tier's tokens-per-percent passively from each `quota` capture. After 2+ samples you can estimate "this 50K-token action will be ~X% of my session."
 
-| Question                                            | Mode                         | Cost  |
-|-----------------------------------------------------|------------------------------|-------|
-| How many tokens has this session burned?            | `summary` or `quick`         | ~10ms |
-| Which subagent dispatch cost the most?              | `agents`                     | ~10ms |
-| Did approach A cost more tokens than approach B?    | `mark` → do work → `since`   | ~10ms |
-| How close to my 5-hour / weekly limit am I?         | `quota`                      | ~12s  |
-| Snapshot for a downstream script                    | `raw` (JSON output)          | ~10ms |
+## First-time setup
 
-Default to the cheap modes. Reserve `quota` for when the user explicitly asks about rolling-window limits or when the agent is gating an expensive autonomous decision on remaining quota.
+```bash
+python3 ${CLAUDE_SKILL_DIR}/meter.py tier max20x   # or pro / max5x
+python3 ${CLAUDE_SKILL_DIR}/meter.py sample        # first calibration sample
+```
+
+(Sample again ~15 min later to derive slopes.)
 
 ## Invocation
 
@@ -31,76 +31,86 @@ python3 ${CLAUDE_SKILL_DIR}/meter.py [mode] [args]
 
 Modes:
 
-- `summary` — (default) full breakdown: main thread, subagents, efficiency signals
-- `quick` — one-line totals (ideal for polling in a `/loop`)
-- `agents` — per-subagent attribution only
-- `mark <name>` — save a checkpoint at the current JSONL byte offset
-- `since <name>` — report delta since a saved checkpoint
-- `marks` — list saved checkpoints
-- `drop <name>` — delete a checkpoint
-- `raw` — dump aggregated counters as JSON
-- `quota` — falls through to the tmux scrape of the built-in `/usage` panel
+| Mode                | Purpose                                                          | Cost   |
+|---------------------|------------------------------------------------------------------|--------|
+| `summary` (default) | Tokens + $ + % session + % week + calibration + signals          | ~12s\* |
+| `summary-fast`      | Same but skip quota refresh (use cached %)                       | ~10ms  |
+| `quick`             | One-line: tokens · $ · cache% · session% · week%                 | ~10ms  |
+| `agents`            | Per-subagent attribution: agentType, $, prompt preview           | ~10ms  |
+| `mark <name>` `[--quota]` | Save a checkpoint, optionally with a quota snapshot        | ~10ms / ~12s |
+| `since <name>`      | Token + $ + quota delta since checkpoint                         | ~10ms  |
+| `marks`             | List saved checkpoints                                           | ~1ms   |
+| `drop <name>`       | Delete a checkpoint                                              | ~1ms   |
+| `raw`               | JSON dump of everything (for downstream tools)                   | ~10ms  |
+| `quota`             | Force-refresh quota panel + show parsed result                   | ~12s   |
+| `sample`            | Take a calibration sample (forces quota capture)                 | ~12s   |
+| `calibrate`         | Show calibration history + derived tokens-per-percent estimates  | ~1ms   |
+| `tier [<t>]`        | Show or set subscription tier (pro / max5x / max20x)             | ~1ms   |
 
-For `quota` specifically, run the legacy capture script directly:
-
-```bash
-bash ${CLAUDE_SKILL_DIR}/capture.sh
-```
+\* The cached quota result is reused for 10 minutes, so consecutive `summary` calls within that window are ~10ms.
 
 ## A/B comparison workflow
 
-The core experimentation pattern. Use this to settle questions like *"does sending the image at native resolution cost more tokens than resizing to 1024×1024?"*:
+For settling questions like *"native-resolution image vision request vs resize to 1024×1024 — which costs fewer tokens?"*:
 
 ```bash
-# 1. Mark the start
-python3 ${CLAUDE_SKILL_DIR}/meter.py mark approach-A
+python3 meter.py mark approach-A --quota
+# ... agent does approach A ...
+python3 meter.py since approach-A
 
-# 2. Do approach A (one or several tool calls / subagent spawns)
-#    ... agent does the work ...
-
-# 3. Measure the delta
-python3 ${CLAUDE_SKILL_DIR}/meter.py since approach-A
-#    → reports tokens consumed since the mark, with main/subagent split
-
-# 4. Mark again before approach B
-python3 ${CLAUDE_SKILL_DIR}/meter.py mark approach-B
-
-# 5. Do approach B
-#    ... agent does the work ...
-
-# 6. Measure
-python3 ${CLAUDE_SKILL_DIR}/meter.py since approach-B
+python3 meter.py mark approach-B --quota
+# ... agent does approach B ...
+python3 meter.py since approach-B
 ```
 
-The agent then compares the two deltas and reports which approach is cheaper, by what margin, and where the difference comes from (input? output? cache reuse?).
+`since` reports tokens + dollars + percentage-point delta on each quota window.
 
-## Output: what the agent should look for
+## Output anatomy
 
-Default `summary` mode prints sections for: **main thread**, **subagents** (with `agentType` grouping and prompt previews), **grand total**, **efficiency signals**.
+A full `summary` reports:
 
-Key signals:
-
-- **Cache hit ratio** — `cache_read / (cache_read + cache_write + fresh_input)`. Above 80% is healthy context reuse; below 50% means the context is churning (something is invalidating the cache, or each turn loads fresh data).
-- **Output / fresh-input ratio** — how verbose the agent is per new token of input. Higher means the agent is generating more per unit of new instruction.
-- **Per-subagent breakdown** — which subagent dispatches dominated the spend, with their prompts visible. Use this to spot "I keep spawning Explore for things that didn't need it" patterns.
+- **Main thread** — turns, tool calls, input/output/cache split, per-model breakdown, API-equivalent dollars, avg-per-turn
+- **Subagents** — grouped by `agentType`, with assumed model (default mapping: Explore→Haiku, general-purpose→Sonnet), per-spawn dollars and prompt preview
+- **Grand total** — tokens + dollars
+- **Tier context** — "this session = N days of your subscription fee in API-equivalent value"
+- **Rolling quota windows** — session 5h, week (all models), week (Sonnet only) with reset times, age of the cached reading
+- **Calibration** — once you have ≥2 samples: tokens-per-percent and estimated full-window capacity
+- **Efficiency signals** — cache hit ratio (good ≥80%, churning <50%), output/input ratio, per-turn growth trend
 
 ## Autonomous self-throttling
 
-Pair the meter with a polling loop for long autonomous work. Example instruction the user gives the agent:
+Tell the agent at the start of a long autonomous run:
 
-> Every 10 minutes, run `/usage2 quick`. If `cache hit` drops below 60% or grand-total grows by more than 500K tokens since the last check, pause and report. If you need to know how close I am to my hard limit, run `/usage2 quota`.
+> Every 10 minutes, run `/usage2 quick`. If session reaches 75% or grand-total grows by more than 500K tokens since the last check, pause and report. If cache hit ratio drops below 60%, also pause — something is invalidating the cache.
 
-Cheap because `quick` is ~10ms and doesn't spawn a process.
+`quick` is ~10ms (uses cached quota). It's free to poll.
+
+## How calibration works
+
+Each time you run `sample` (or any mode that refreshes the quota panel), the meter records:
+
+- Current %s for the three quota windows
+- The trailing 5h and 7d token totals (weighted by API-rate ratios into "input-equivalent" units)
+
+From ≥2 samples, the meter computes tokens-per-percent for each window. With this you can:
+
+- See your tier's effective rolling-window capacity
+- Estimate the % impact of a planned action before doing it
+- Spot anomalies (a sudden jump in % with little token usage usually means the panel reset)
+
+Anthropic doesn't publish exact per-tier token caps — calibration is how `usage2` learns them empirically.
 
 ## Caveats
 
-- **The current in-flight turn is not yet in the JSONL** — Claude Code writes the assistant message + usage block only after the turn completes. So the meter is always one turn behind the live state. Fine for between-turn polling; not suitable for in-turn metering.
-- **Subagents are aggregated, not per-step** — `toolUseResult.totalTokens` gives the full cost of a subagent dispatch, but you can't see its internal turn-by-turn breakdown from the parent transcript. (Subagents may have their own JSONL files in `~/.claude/projects/`; the meter doesn't currently descend into those.)
-- **Hooks aren't included** — if a PostToolUse / PreCompact hook injects context, that shows up in the next assistant turn's input count, but isn't separately attributed.
-- **"Current session" = most-recently-modified JSONL** in the cwd's project slug dir. If multiple Claude Code instances are running in the same project, the meter reads whichever was written to most recently.
+- **The current in-flight turn isn't yet in the JSONL.** Claude Code writes assistant messages after the turn completes. The meter is always one turn behind.
+- **Subagents are aggregated, not per-step.** `toolUseResult.totalTokens` gives the full cost of a subagent dispatch, but the parent transcript doesn't include the subagent's internal turn-by-turn detail. Subagent costs assume a model per `agentType` (see `AGENT_TYPE_MODEL` in `meter.py`).
+- **Hooks aren't separately attributed.** PostToolUse / PreCompact hooks that inject context show up in the next assistant turn's input count, not as their own line.
+- **Quota panel scrape spawns a real `claude` process.** No LLM tokens, but ~12s of latency. The 10-min cache amortizes this.
+- **Subscription tier display vs reality.** The "days of subscription fee" line is informational — it doesn't represent your actual cost (which is the flat monthly fee), it represents the API-equivalent value of what you consumed.
+- **API rates can shift.** `RATES` is hardcoded in `meter.py` — update when Anthropic publishes new pricing.
 
 ## Failure modes
 
-- `ERR: no JSONL found for project slug '...'` — the cwd doesn't have a Claude Code transcript yet (brand new project) or the project-slug rule has changed (CC version drift). Check `~/.claude/projects/` manually.
-- `ERR: no mark named 'X'` — `since X` was called without a prior `mark X`.
-- `quota` mode failures — see `capture.sh` failure modes (claude UI didn't render, usage panel didn't show). Re-run.
+- `ERR: no JSONL found for project slug '...'` — fresh project with no transcript yet, or CC's slug-naming convention drifted.
+- `ERR: could not capture /usage panel` — see `capture.sh` for tmux scrape failure modes.
+- Calibration estimates wrong/wild — too few samples, or all samples are within the same quota window since reset. Take more samples across longer time spans.
