@@ -90,9 +90,23 @@ def project_slug(path: Path) -> str:
 
 
 def current_session_jsonl(cwd: Path | None = None) -> Path | None:
+    """Find the JSONL for the calling Claude Code session.
+
+    Preference order:
+      1. $CLAUDE_CODE_SESSION_ID — set by Claude Code in its own env; authoritative.
+         Critical when multiple CC instances run in the same project (each writes
+         its own JSONL; "most recently modified" would mis-attribute work).
+      2. Most-recently-modified *.jsonl in the project dir (fallback for older CC
+         or non-CC invocations).
+    """
     cwd = cwd or Path.cwd()
     p = PROJECTS_DIR / project_slug(cwd)
     if not p.exists(): return None
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if sid:
+        candidate = p / f"{sid}.jsonl"
+        if candidate.exists():
+            return candidate
     files = list(p.glob("*.jsonl"))
     return max(files, key=lambda f: f.stat().st_mtime) if files else None
 
@@ -480,6 +494,7 @@ def report_summary(jsonl: Path, byte_offset: int = 0, label: str = "",
     tier_info = TIERS.get(tier) if tier else None
 
     print(f"## /usage2 summary{(' — ' + label) if label else ''}")
+    print(f"## Source: {jsonl.name}  ({'env-pinned' if os.environ.get('CLAUDE_CODE_SESSION_ID') else 'mtime-picked'})")
     print()
     print("### Main thread")
     if m["turns"] == 0:
