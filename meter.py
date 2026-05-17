@@ -40,14 +40,20 @@ CAPTURE_SH = SKILL_DIR / "capture.sh"
 
 QUOTA_CACHE_TTL_SECONDS = 600  # 10 min
 
-# Anthropic API rates ($ per million tokens). Update as Anthropic publishes new rates.
-# 1h cache write is the dominant ephemeral category in our transcripts.
+# Anthropic API rates ($ per million tokens). Sourced from
+# https://platform.claude.com/docs/en/docs/about-claude/pricing (verified 2026-05-17).
+# Update when Anthropic publishes new rates.
+# NOTE: Opus 4.5/4.6/4.7 are priced 1/3 of Opus 4.1 — the price cut took
+# effect with Opus 4.5. Do not assume Opus = $15/$75.
 RATES = {
-    "claude-opus-4-7":     {"input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_write_5m": 18.75, "cache_write_1h": 30.00},
-    "claude-opus-4-6":     {"input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_write_5m": 18.75, "cache_write_1h": 30.00},
+    "claude-opus-4-7":     {"input":  5.00, "output": 25.00, "cache_read": 0.50, "cache_write_5m":  6.25, "cache_write_1h": 10.00},
+    "claude-opus-4-6":     {"input":  5.00, "output": 25.00, "cache_read": 0.50, "cache_write_5m":  6.25, "cache_write_1h": 10.00},
+    "claude-opus-4-5":     {"input":  5.00, "output": 25.00, "cache_read": 0.50, "cache_write_5m":  6.25, "cache_write_1h": 10.00},
+    "claude-opus-4-1":     {"input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_write_5m": 18.75, "cache_write_1h": 30.00},
     "claude-sonnet-4-6":   {"input":  3.00, "output": 15.00, "cache_read": 0.30, "cache_write_5m":  3.75, "cache_write_1h":  6.00},
     "claude-sonnet-4-5":   {"input":  3.00, "output": 15.00, "cache_read": 0.30, "cache_write_5m":  3.75, "cache_write_1h":  6.00},
-    "claude-haiku-4-5":    {"input":  0.80, "output":  4.00, "cache_read": 0.08, "cache_write_5m":  1.00, "cache_write_1h":  1.60},
+    "claude-haiku-4-5":    {"input":  1.00, "output":  5.00, "cache_read": 0.10, "cache_write_5m":  1.25, "cache_write_1h":  2.00},
+    "claude-haiku-3-5":    {"input":  0.80, "output":  4.00, "cache_read": 0.08, "cache_write_5m":  1.00, "cache_write_1h":  1.60},
 }
 # Fallback when we can't determine model (subagents). Sonnet is the default agent model.
 DEFAULT_RATE_KEY = "claude-sonnet-4-6"
