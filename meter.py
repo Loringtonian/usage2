@@ -229,40 +229,61 @@ def weighted_input_equiv(b: dict, model: str) -> float:
 
 # ─────────────────────────── window aggregation ───────────────────────────
 
-def tokens_in_window(jsonl: Path, window_seconds: float) -> dict:
-    """Sum per-model trailing-window token counts from the transcript."""
+def find_active_jsonls(window_seconds: float, exclude: Path | None = None) -> list[Path]:
+    """Return all *.jsonl across ~/.claude/projects/*/ modified within the window.
+
+    Used for account-scope token aggregation when the user runs multiple
+    concurrent Claude Code sessions. Each session has its own JSONL, but the
+    /usage panel reflects the whole account — so the calibration needs to see
+    ALL of them to correctly attribute tokens-per-percent.
+    """
+    cutoff = time.time() - window_seconds
+    out = []
+    if not PROJECTS_DIR.exists(): return out
+    for proj in PROJECTS_DIR.iterdir():
+        if not proj.is_dir(): continue
+        for f in proj.glob("*.jsonl"):
+            try:
+                if f.stat().st_mtime < cutoff: continue
+                if exclude and f.resolve() == exclude.resolve(): continue
+                out.append(f)
+            except: continue
+    return out
+
+
+def tokens_in_window(jsonl: Path | list[Path], window_seconds: float) -> dict:
+    """Sum per-model trailing-window token counts.
+
+    Pass a single Path for session-scope, or a list for account-scope.
+    """
+    sources = jsonl if isinstance(jsonl, list) else [jsonl]
     cutoff = time.time() - window_seconds
     by_model = {}
-    for r in parse_records(jsonl):
-        rtype = r.get("type")
-        ts = ts_seconds(r.get("timestamp"))
-        if ts < cutoff: continue
-        if rtype == "assistant" and not r.get("isSidechain"):
-            msg = r.get("message") or {}
-            u = msg.get("usage")
-            model = msg.get("model")
-            if u and model not in SKIP_MODELS:
-                cc = u.get("cache_creation") or {}
-                bm = by_model.setdefault(model,
-                    {"input": 0, "output": 0, "cache_read": 0, "cache_write_5m": 0, "cache_write_1h": 0})
-                bm["input"] += u.get("input_tokens", 0) or 0
-                bm["output"] += u.get("output_tokens", 0) or 0
-                bm["cache_read"] += u.get("cache_read_input_tokens", 0) or 0
-                bm["cache_write_5m"] += cc.get("ephemeral_5m_input_tokens", 0) or 0
-                bm["cache_write_1h"] += cc.get("ephemeral_1h_input_tokens", 0) or 0
-        if rtype == "user":
-            tur = r.get("toolUseResult")
-            if isinstance(tur, dict) and tur.get("agentType"):
-                u = tur.get("usage") or {}
-                cc = u.get("cache_creation") or {}
-                model = AGENT_TYPE_MODEL.get(tur.get("agentType"), DEFAULT_RATE_KEY)
-                bm = by_model.setdefault(model,
-                    {"input": 0, "output": 0, "cache_read": 0, "cache_write_5m": 0, "cache_write_1h": 0})
-                bm["input"] += u.get("input_tokens", 0) or 0
-                bm["output"] += u.get("output_tokens", 0) or 0
-                bm["cache_read"] += u.get("cache_read_input_tokens", 0) or 0
-                bm["cache_write_5m"] += cc.get("ephemeral_5m_input_tokens", 0) or 0
-                bm["cache_write_1h"] += cc.get("ephemeral_1h_input_tokens", 0) or 0
+    def _add(model, u, cc):
+        bm = by_model.setdefault(model,
+            {"input": 0, "output": 0, "cache_read": 0, "cache_write_5m": 0, "cache_write_1h": 0})
+        bm["input"] += u.get("input_tokens", 0) or 0
+        bm["output"] += u.get("output_tokens", 0) or 0
+        bm["cache_read"] += u.get("cache_read_input_tokens", 0) or 0
+        bm["cache_write_5m"] += cc.get("ephemeral_5m_input_tokens", 0) or 0
+        bm["cache_write_1h"] += cc.get("ephemeral_1h_input_tokens", 0) or 0
+    for src in sources:
+        for r in parse_records(src):
+            ts = ts_seconds(r.get("timestamp"))
+            if ts < cutoff: continue
+            rtype = r.get("type")
+            if rtype == "assistant" and not r.get("isSidechain"):
+                msg = r.get("message") or {}
+                u = msg.get("usage")
+                model = msg.get("model")
+                if u and model not in SKIP_MODELS:
+                    _add(model, u, u.get("cache_creation") or {})
+            if rtype == "user":
+                tur = r.get("toolUseResult")
+                if isinstance(tur, dict) and tur.get("agentType"):
+                    u = tur.get("usage") or {}
+                    model = AGENT_TYPE_MODEL.get(tur.get("agentType"), DEFAULT_RATE_KEY)
+                    _add(model, u, u.get("cache_creation") or {})
     raw_total = sum(sum(bm.values()) for bm in by_model.values())
     weighted = sum(weighted_input_equiv(bm, mdl) for mdl, bm in by_model.items())
     dollars = sum(cost_of(bm, mdl) for mdl, bm in by_model.items())
@@ -370,8 +391,14 @@ def refresh_quota(force: bool = False, write_report: bool = True, jsonl: Path | 
             cfg = load_config()
             tier_key = cfg.get("tier")
             tier_info = TIERS.get(tier_key, {})
-            w5h = tokens_in_window(jsonl, 5 * 3600)
-            w7d = tokens_in_window(jsonl, 7 * 86400)
+            # Account-scope: all local JSONLs modified in the window
+            others_5h = find_active_jsonls(5 * 3600, exclude=jsonl)
+            others_7d = find_active_jsonls(7 * 86400, exclude=jsonl)
+            session_5h = tokens_in_window(jsonl, 5 * 3600)
+            session_7d = tokens_in_window(jsonl, 7 * 86400)
+            account_5h = tokens_in_window([jsonl] + others_5h, 5 * 3600)
+            account_7d = tokens_in_window([jsonl] + others_7d, 7 * 86400)
+            # Top-level dollars/weighted = account scope (for calibration use)
             save_report({
                 "schema_version": SCHEMA_VERSION,
                 "timestamp_iso": datetime.now(timezone.utc).isoformat(),
@@ -384,8 +411,10 @@ def refresh_quota(force: bool = False, write_report: bool = True, jsonl: Path | 
                 "panel": {k: parsed.get(k) for k in
                           ("session_pct", "session_reset", "week_all_pct", "week_reset",
                            "week_sonnet_pct", "week_sonnet_reset")},
-                "trailing_5h": w5h,
-                "trailing_7d": w7d,
+                "trailing_5h": {**account_5h, "session_scope": session_5h},
+                "trailing_7d": {**account_7d, "session_scope": session_7d},
+                "concurrent_5h": [p.stem for p in others_5h],
+                "concurrent_7d": [p.stem for p in others_7d],
             })
         return parsed
     except Exception:
@@ -551,6 +580,28 @@ def report_summary(jsonl: Path, byte_offset: int = 0, label: str = "",
         # User-triggered summary always force-refreshes so each /usage2 invocation
         # writes a fresh report. Cache is for cheap-polling (quick) only.
         quota = refresh_quota(force=True, jsonl=jsonl)
+        # Concurrent-session detection — filter to JSONLs with meaningful token
+        # activity in the actual rolling 5h window ($1+ API-equiv). mtime alone is
+        # too noisy (hooks bump mtime on otherwise-idle files).
+        others = find_active_jsonls(5 * 3600, exclude=jsonl)
+        scored = []
+        for o in others:
+            try:
+                w = tokens_in_window(o, 5 * 3600)
+                if w["dollars"] >= 1.0:
+                    scored.append((o, w["dollars"]))
+            except: pass
+        scored.sort(key=lambda x: -x[1])
+        if scored:
+            total_other_dollars = sum(d for _, d in scored)
+            print(f"### ⚠ Concurrent sessions consuming the same quota (last 5h): {len(scored)}  ·  total {fmt_dollars(total_other_dollars)}")
+            for o, d in scored[:5]:
+                slug = o.parent.name.lstrip("-").replace("-", "/")
+                print(f"  • {o.stem[:13]}…  {fmt_dollars(d):>7}  in /{slug[:80]}")
+            if len(scored) > 5: print(f"  …+{len(scored)-5} more (run `usage2 raw` for full list)")
+            print(f"  ▸ Panel %s reflect ALL of these. To avoid distorting your own calibration,")
+            print(f"    pause concurrent agents during a sampling run, or accept the noise.")
+            print()
         print("### Rolling quota windows")
         if not quota:
             print("  (quota panel unavailable)")
