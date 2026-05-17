@@ -536,7 +536,9 @@ def report_summary(jsonl: Path, byte_offset: int = 0, label: str = "",
     print()
 
     if not skip_quota:
-        quota = refresh_quota(jsonl=jsonl)
+        # User-triggered summary always force-refreshes so each /usage2 invocation
+        # writes a fresh report. Cache is for cheap-polling (quick) only.
+        quota = refresh_quota(force=True, jsonl=jsonl)
         print("### Rolling quota windows")
         if not quota:
             print("  (quota panel unavailable)")
