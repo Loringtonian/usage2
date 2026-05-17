@@ -401,18 +401,30 @@ def median(xs):
 
 def slope_from_reports(reports: list[dict], pct_key: str, window_key: str,
                        tier_filter: str | None = None) -> dict | None:
-    """Median of consecutive-pair slopes within same (anonymous_id, tier) group."""
+    """Median of consecutive-pair slopes within same (anonymous_id, tier) group.
+
+    Uses *dollars* as the calibration unit — naturally weights Opus / Sonnet / Haiku
+    tokens correctly relative to each other (and across input / output / cache types)
+    because Anthropic's per-model rate ratios are baked into the dollar conversion.
+
+    Falls back to legacy `weighted_input_equiv` for old reports without dollars.
+    """
     samples = []
     for r in reports:
         if tier_filter and r.get("tier") != tier_filter: continue
         pct = (r.get("panel") or {}).get(pct_key)
-        tokens = (r.get(window_key) or {}).get("weighted_input_equiv")
+        win = r.get(window_key) or {}
+        value = win.get("dollars")
+        if value is None:
+            # Legacy reports stored only weighted_input_equiv — convert it back to
+            # dollars approximately by assuming Opus rate (close enough for slope ratios).
+            w = win.get("weighted_input_equiv")
+            value = w * 5.0 / 1_000_000 if w is not None else None
         anon = r.get("anonymous_id", "anon")
         epoch = r.get("epoch", 0)
-        if pct is None or tokens is None or pct <= 0: continue
-        samples.append({"anon": anon, "epoch": epoch, "pct": pct, "tokens": tokens})
+        if pct is None or value is None or pct <= 0: continue
+        samples.append({"anon": anon, "epoch": epoch, "pct": pct, "dollars": value})
     if len(samples) < 2: return None
-    # Group by anon, sort by epoch within group, take consecutive slopes
     by_anon = {}
     for s in samples: by_anon.setdefault(s["anon"], []).append(s)
     slopes = []
@@ -420,14 +432,14 @@ def slope_from_reports(reports: list[dict], pct_key: str, window_key: str,
         grp.sort(key=lambda x: x["epoch"])
         for i in range(1, len(grp)):
             dp = grp[i]["pct"] - grp[i-1]["pct"]
-            dt = grp[i]["tokens"] - grp[i-1]["tokens"]
-            if dp > 0 and dt > 0: slopes.append(dt / dp)
+            dd = grp[i]["dollars"] - grp[i-1]["dollars"]
+            if dp > 0 and dd > 0: slopes.append(dd / dp)
     if not slopes:
-        # Single-sample fallback: tokens / pct (assumes linear from zero)
-        slopes = [s["tokens"] / s["pct"] for s in samples if s["pct"] > 0]
+        slopes = [s["dollars"] / s["pct"] for s in samples if s["pct"] > 0]
     if not slopes: return None
     m = median(slopes)
-    return {"tokens_per_percent": int(m), "est_full_capacity": int(m * 100),
+    return {"dollars_per_percent": round(m, 4),
+            "est_full_capacity_dollars": round(m * 100, 2),
             "samples": len(samples), "slopes_used": len(slopes)}
 
 
@@ -557,17 +569,28 @@ def report_summary(jsonl: Path, byte_offset: int = 0, label: str = "",
     est = calibration_estimates(include_crowd=include_crowd, tier_filter=tier)
     crowd_note = f" + {est['crowd_count']} crowd" if est['crowd_count'] else ""
     print(f"### Calibration ({est['own_count']} own reports{crowd_note}{', tier=' + tier if tier else ''})")
-    if est["session"]:
-        e = est["session"]
-        print(f"  Session 5h capacity:    ~{fmt(e['est_full_capacity'])} weighted-input-equiv tok  ({fmt(e['tokens_per_percent'])} per 1%, {e['slopes_used']} slopes)")
-    else:
-        print("  Session 5h:             (need ≥2 reports with delta)")
-    if est["week_all"]:
-        e = est["week_all"]
-        print(f"  Week 7d (all models):   ~{fmt(e['est_full_capacity'])} weighted-input-equiv tok  ({fmt(e['tokens_per_percent'])} per 1%, {e['slopes_used']} slopes)")
-    if est["week_sonnet"]:
-        e = est["week_sonnet"]
-        print(f"  Week 7d (Sonnet only):  ~{fmt(e['est_full_capacity'])} weighted-input-equiv tok  ({fmt(e['tokens_per_percent'])} per 1%, {e['slopes_used']} slopes)")
+
+    def per_model_input_for(dollars_per_pct: float) -> str:
+        """Show how many input tokens of each model 1% of quota allows."""
+        parts = []
+        for model_short, key in (("Opus", "claude-opus-4-7"), ("Sonnet", "claude-sonnet-4-6"), ("Haiku", "claude-haiku-4-5")):
+            rate = RATES[key]["input"]  # $/M tokens
+            tokens_per_pct = dollars_per_pct / rate * 1_000_000
+            parts.append(f"{model_short} {fmt(tokens_per_pct)}")
+        return " · ".join(parts)
+
+    def print_window(name: str, e: dict | None):
+        if e is None:
+            print(f"  {name:<24} (need ≥2 reports with delta)")
+            return
+        d_pct = e["dollars_per_percent"]
+        cap = e["est_full_capacity_dollars"]
+        print(f"  {name:<24} 1% ≈ {fmt_dollars(d_pct)}  ·  100% ≈ {fmt_dollars(cap)}  ·  {e['slopes_used']} slopes from {e['samples']} samples")
+        print(f"  {' ':<24}   per 1% in pure-input tokens: {per_model_input_for(d_pct)}")
+
+    print_window("Session 5h:",         est["session"])
+    print_window("Week 7d (all):",      est["week_all"])
+    print_window("Week 7d (Sonnet):",   est["week_sonnet"])
     if not include_crowd and CROWD_DIR.exists() and any(CROWD_DIR.glob("*.json")):
         print(f"  (Hint: pass --crowd to include {sum(1 for _ in CROWD_DIR.glob('*.json'))} community-contributed reports)")
     print()
