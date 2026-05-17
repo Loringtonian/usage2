@@ -1,102 +1,139 @@
 # usage2
 
-A tiny Claude Code skill that lets the agent **see** the built-in `/usage` panel — quota state, session/week/Sonnet-only meters, reset times — by capturing it as plaintext from a throwaway headless `claude` instance running inside tmux.
+A Claude Code skill that gives the agent **visibility into its own token consumption** — main thread, per-subagent, with cache breakdown and A/B checkpoints — so it can reason about its own efficiency instead of flying blind.
 
 ```
-Session 63%        ███████████████████████████████▌
-Week (all models)  ██████████████████████████████▌   61%
-Week (Sonnet only) ██████████████████████████▌       53%
-Resets: 8:10pm (session) · May 18 3am (week)
+## Token usage
+### Main thread (200 turns, 117 tool calls)
+  Input (fresh):      121.9K
+  Output:             265.0K
+  Cache read:         24.50M  (94% of all input)
+  Cache write:        1.46M
+  Main-thread total:  26.35M
+
+### Subagents (3 spawns, 187.9K tokens)
+  Explore × 3: 187.9K
+    └─ 52.0K  in 6  out 1.9K  cache-r 49.7K  45.4s  16 tools  "Audit branch ship-readiness…"
+    └─ 61.9K  in 4  out 1.9K  cache-r 59.9K  66.1s  30 tools  "Plan a fix for two broken hooks…"
+    └─ 74.0K  in 2  out 3.4K  cache-r 70.4K  83.2s  21 tools  "Plan a Buckminster Fuller deep dive…"
+
+### Grand total: 26.54M tokens
+### Efficiency signals
+  Cache hit ratio:       94%   (good context reuse)
+  Output / fresh input:  0.17x
 ```
 
 ## Why this exists
 
-Claude Code has a built-in `/usage` command that opens a TUI panel showing your rolling quota windows. It's useful — but **the agent can't see it.** Built-in slash commands paint pixels into your terminal; they don't expose their contents as tool output.
+Until now, when you ask Claude "am I being token-efficient?" or "did approach A cost more than approach B?", the honest answer is *"I have no idea — I can't see my own usage."* Claude Code paints a `/usage` panel into your terminal, but the agent can't see TUI panels. Even less visible: the per-subagent attribution, the cache hit ratio, the per-turn growth — Claude has been flying blind on its own resource use.
 
-So if you ask the agent "am I close to my weekly limit?", the honest answer is *"I don't know — type `/usage` and tell me."* That's a worse experience than the agent being able to look for itself before deciding whether to dispatch a big parallel job, run a long-context skill, or call you back later.
+`usage2` fixes that by reading Claude Code's **session transcript JSONL** — the file the CLI writes to `~/.claude/projects/<slug>/<session>.jsonl` as the API responds. Every assistant turn carries a `usage` block with `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`. Every Task/Agent dispatch lands a `toolUseResult` record with the subagent's `totalTokens`, `agentType`, full `usage` breakdown, `toolStats`, and a prompt preview.
 
-`/usage2` fixes that. It spawns a second, throwaway `claude` process in a detached tmux session, sends it `/usage`, captures the rendered panel as plaintext, and prints it. The agent reads the plaintext like any other tool output and reasons about your quota in chat.
+Sum these and you get authoritative per-action token attribution. No API key. No scraping. ~10ms per query.
 
-No LLM call is made by the spawned instance — `/usage` is a local panel that hits Anthropic's quota endpoint directly. So the workaround is essentially free (no token spend, no quota burn beyond what `/usage` itself would do if you typed it).
+The skill ALSO retains its earlier capability: a tmux-driven scrape of the built-in `/usage` panel for rolling 5h / 7d / Sonnet-only quota state with reset times. That's the answer to "how close to the hard limit am I?" — the transcript-level meter can't replace it because Anthropic's per-account quota windows aren't reconstructable from local data alone.
 
 ## Who this is for
 
-People who use Claude Code (or a similar agent) to do long autonomous work and want the **agent itself** to be able to:
+People doing **long autonomous work with Claude** who want the agent itself to be able to:
 
-- **Self-assess token efficiency** as it works — "I've burned 40% of my 5-hour window on three failed attempts at this; is this approach worth continuing?"
-- **Throttle itself** before hitting a wall — schedule `/usage2` on a loop and have the agent pause, hand off, or wind down at a self-imposed threshold instead of getting cut off mid-task.
-- **Pick model tiers based on remaining budget** — drop from Opus to Sonnet, or from Sonnet to Haiku, when the corresponding weekly meter is nearing its ceiling.
-- **Plan parallel fan-outs honestly** — "I have 8% of my Sonnet-week left; don't spawn 12 subagents."
+- **Reason about token efficiency** — "I burned 50K tokens on that subagent dispatch; was it worth it?"
+- **Run A/B experiments** — "Does this image at native resolution actually cost more tokens than resized to 1024×1024? Let me mark, run both, and check."
+- **Self-throttle on long runs** — poll `/usage2 quick` every 10 minutes; pause when grand-total grows by 500K+ since the last check or cache-hit drops below 60%.
+- **Attribute the cost back to the choice** — which subagent, with which prompt, burned how many tokens.
+- **Pick model tiers based on remaining budget** — drop from Opus to Sonnet, or scale back parallel fan-outs, when the meter shows trouble.
 
-This turns quota from an external constraint the user has to babysit into a signal the agent can reason about on its own.
-
-## Common recipes
-
-### Self-throttling on a long autonomous run
-
-Tell the agent at the start of a session:
-
-> Run `/usage2` every 10 minutes. If session usage goes above 75% — or if Sonnet-week goes above 90% — stop spawning new subagents, finish anything in flight, write a handoff note, and wait for me.
-
-The agent then loops the skill on its own cadence (most agents have a `/loop` or scheduling primitive; if not, it can simply re-invoke between major steps) and treats the percentage thresholds as a soft brake.
-
-### One-shot pre-flight check
-
-Before kicking off something expensive (a parallel fan-out, a long context load, a big vision pass), the agent runs `/usage2` once and reports the numbers so you can both decide whether to proceed.
-
-### Mid-task budget-aware decisions
-
-When the agent hits a fork in the road — "should I dig deeper or hand this back?" — having current quota numbers in context lets it factor remaining budget into the call instead of guessing.
+This turns quota and token cost from external constraints the user has to babysit into signals the agent can reason about on its own.
 
 ## What it consists of
 
-Two files, ~140 lines total:
+- **`meter.py`** — Python script that parses the session JSONL and reports token usage. Modes: `summary`, `quick`, `agents`, `mark`, `since`, `marks`, `drop`, `raw`, `quota`.
+- **`capture.sh`** — Bash + tmux that captures the built-in `/usage` panel's rolling-window meters (the original v1 of this skill).
+- **`SKILL.md`** — Claude Code skill descriptor.
 
-- **`capture.sh`** — bash script that runs the tmux dance: spawn `claude`, dismiss the trust prompt, send `/usage`, poll until the panel renders, capture the pane, strip ANSI, print.
-- **`SKILL.md`** — Claude Code skill descriptor (frontmatter + agent-facing instructions on when to invoke and how to interpret the output).
+Zero external dependencies. Pure stdlib Python 3 + bash + tmux. No API keys.
 
-No daemon. No config. No state between runs. No npm/Python/API keys.
+## Modes
+
+| Mode | What it does | Cost |
+|------|--------------|------|
+| `summary` (default) | Full breakdown: main thread + subagents + efficiency signals | ~10ms |
+| `quick` | One-line totals (cheap to poll in a loop) | ~10ms |
+| `agents` | Per-subagent attribution only | ~10ms |
+| `mark <name>` | Save a checkpoint at the current JSONL byte offset | ~1ms |
+| `since <name>` | Report delta since a saved checkpoint (A/B comparisons) | ~10ms |
+| `marks` | List saved checkpoints | ~1ms |
+| `drop <name>` | Delete a checkpoint | ~1ms |
+| `raw` | Dump aggregated counters as JSON (for downstream tools) | ~10ms |
+| `quota` | Capture the rolling 5h / 7d / Sonnet-only meters (tmux scrape) | ~12s |
+
+## The A/B workflow
+
+This is the experimentation pattern Claude couldn't do before:
+
+```bash
+# Approach A
+python3 meter.py mark approach-A
+#   ... agent does the work (one or many tool calls / subagent spawns) ...
+python3 meter.py since approach-A
+#   → tokens consumed since the mark, with main + subagent split
+
+# Approach B
+python3 meter.py mark approach-B
+#   ... agent does the work ...
+python3 meter.py since approach-B
+```
+
+Claude reads the two deltas and tells you which approach cost less, by how much, and where the difference came from (fresh input? output verbosity? cache reuse?).
+
+## Autonomous self-throttling pattern
+
+Tell the agent at the start of a long autonomous run:
+
+> Every 10 minutes, run `/usage2 quick`. If cache hit ratio drops below 60% or grand-total grows by more than 500K tokens since the last check, pause and report. If you need to know how close I am to my hard limit, run `/usage2 quota`.
+
+`quick` is ~10ms, so polling is essentially free.
 
 ## Requirements
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (the `claude` CLI on `$PATH`)
-- `tmux` — `brew install tmux` if you don't have it
+- Python 3.10+ (stdlib only)
+- `tmux` (only needed for the `quota` mode — `brew install tmux`)
 - bash 3+ (macOS default works)
 
 ## Install
-
-Drop the skill into your Claude Code skills directory:
 
 ```bash
 git clone https://github.com/Loringtonian/usage2.git
 mkdir -p ~/.claude/skills
 cp -r usage2 ~/.claude/skills/usage2
-chmod +x ~/.claude/skills/usage2/capture.sh
+chmod +x ~/.claude/skills/usage2/capture.sh ~/.claude/skills/usage2/meter.py
 ```
 
-Then in any Claude Code session, type `/usage2` (or ask the agent "what's my quota?", "am I close to the limit?", etc.) and it'll capture the panel and summarize.
+Then in any Claude Code session, type `/usage2` (or ask: "how many tokens has this session burned?", "which subagent dispatch cost the most?", "compare approach A vs approach B token-wise", etc.).
 
-## How it works
+## How the meter works
 
-1. Spawn `claude` inside a detached tmux session in an empty temp dir (no project `CLAUDE.md` autoload → fast boot).
-2. Poll the pane for the "trust this folder?" prompt and send `Enter` to accept.
-3. Poll for the main UI to render (status bar markers).
-4. Send `/usage` + `Enter`.
-5. Poll for the rendered panel keywords (`5-hour`, `7-day`, `week`, `Reset`, etc.).
-6. `tmux capture-pane -p -S -500` to grab the visible pane plus a chunk of scrollback as plaintext.
-7. Strip stray ANSI escapes with sed (belt-and-suspenders; tmux's default capture is already plaintext).
-8. Kill the tmux session and clean up the temp dir on exit.
+1. Compute the project slug from `cwd`: leading slash → `-`, all `/` → `-`, all `_` → `-`. (Claude Code's naming convention.)
+2. Find the most-recently-modified `*.jsonl` in `~/.claude/projects/<slug>/`. That's the current session.
+3. Stream the JSONL. For each assistant record with `isSidechain` falsy, sum the `message.usage` block. For each user record with `toolUseResult.agentType`, sum `totalTokens` and pull the `usage`, `toolStats`, `agentType`, `prompt` for attribution.
+4. Compute derived signals (cache hit ratio, output/input ratio, per-turn growth) and print.
 
-Total runtime: ~8–15 seconds, dominated by claude's boot.
-
-The agent receives the full pane dump and is instructed (via `SKILL.md`) to pull out the three percentage bars + reset times and give you a one-line summary in chat. The raw panel is included only on request.
+`mark` saves the current file size as a byte offset. `since` reopens the file at that offset and runs the same aggregation on just the new lines.
 
 ## Caveats
 
-- The spawned `claude` is real — you'll see one extra short-lived process while it runs. It uses no LLM tokens, but it does briefly hold an MCP connection slot etc.
-- If Anthropic restyles the `/usage` panel layout, the parser-free approach still works — the skill just dumps whatever is on screen and lets the agent figure it out.
-- The panel's "What's contributing to your limits usage?" section often shows `Scanning local sessions…` because the capture is taken before that async scan finishes. The three top percentage bars are reliable; the contributor breakdown isn't.
-- If the trust prompt has been disabled in your CC config, the script's prompt-polling step times out silently and continues — no harm done.
+- **The current in-flight turn is not yet in the JSONL.** Claude Code writes the assistant message + usage block after the turn completes. The meter is always one turn behind the live state. Fine for between-turn polling; not for in-turn metering.
+- **Subagents are aggregated, not per-step.** `toolUseResult.totalTokens` gives the full cost of a subagent dispatch, but the parent transcript doesn't include the subagent's internal turn-by-turn detail. (Subagents may have their own JSONL files — the meter doesn't currently descend into those. Open improvement.)
+- **Hooks aren't separately attributed.** A PostToolUse / PreCompact hook that injects context shows up in the next assistant turn's input count, but isn't broken out.
+- **"Current session" = most-recently-modified JSONL** in the cwd's project slug dir. If multiple Claude Code instances are running in the same project, the meter reads whichever was written to most recently. Generally fine; edge cases exist.
+- **Quota mode (the tmux scrape) spawns a real `claude` process** — uses no LLM tokens, but adds ~12s of latency.
+
+## Comparison to similar approaches
+
+- **`claude -p` `total_cost_usd`** — works only for subprocess (non-interactive) runs, gives a single per-invocation number, no breakdown.
+- **`anthropic.count_tokens()`** — pre-counts input tokens for a planned API call, requires an API key (not available on Pro Max), only covers input not output.
+- **OTEL telemetry** (`CLAUDE_CODE_ENABLE_TELEMETRY=1`) — Anthropic's official path for structured token metrics. More powerful but requires a collector (Prometheus / Grafana / etc.) and config. `usage2` is the zero-setup alternative.
 
 ## License
 
@@ -104,4 +141,4 @@ MIT. See `LICENSE`.
 
 ## Background
 
-Built in one session in May 2026 after asking Claude "what's my usage?" one too many times. Original `/usage` is Claude Code's built-in command; `usage2` is the agent-visible companion. The trick — driving an interactive TUI process from a sibling shell via tmux and reading the rendered screen as plaintext — generalizes to any other built-in panel an agent can't otherwise see.
+Built in May 2026 while trying to settle a token-efficiency question on the Personal Media Archive project (biographical-detail subagents on photos: native res vs 1024×1024?) and discovering the agent had no way to answer. The first version of `/usage2` (v1) was a tmux scrape of the built-in `/usage` panel. v2 (this version) adds the real value: per-action token attribution from the session transcript, including subagent costs. The trick — that Claude Code already writes authoritative per-message usage blocks to local JSONL files — generalizes: any other "give the agent visibility into something it currently can't see" problem in CC probably has a similar local-file answer.
