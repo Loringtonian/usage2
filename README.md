@@ -175,6 +175,7 @@ In any Claude Code session, type `/usage2` (or just ask: "how many tokens has th
 
 ## Caveats
 
+- **Concurrent Claude Code sessions distort calibration.** When you run multiple CC instances on the same account in parallel, the /usage panel reflects all of them but each session's transcript only sees its own tokens. The meter now detects concurrent sessions (other JSONLs with ≥$1 of activity in the rolling window) and aggregates their tokens for calibration's account-scope view. It also surfaces them in `summary` output with a ⚠ block. **For cleanest calibration, pause concurrent agents during sampling runs** — or take many samples across varied concurrency patterns and let the noise average out. Cross-device usage (claude.ai web, other machines) is still invisible to the local meter; the panel sees it, the meter can't.
 - **The in-flight turn isn't in the JSONL yet.** The meter is always one turn behind the live state. Fine for between-turn polling.
 - **Subagents are aggregated.** You see the full cost of each spawn, not its internal turn-by-turn breakdown.
 - **Hooks aren't separately attributed.** Context they inject shows up in the next assistant turn's input count.
