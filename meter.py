@@ -1,25 +1,31 @@
 #!/usr/bin/env python3
 """
-usage2 meter — local token + cost + quota meter for Claude Code subscription users.
+usage2 meter — local + crowd-informed token / cost / quota meter
+for Claude Code subscription users (Pro / Max 5x / Max 20x).
 
-This skill is for people on a Claude subscription (Pro, Max 5x, Max 20x).
-The dollar figures it reports are *API-equivalent* (what you would have paid
-on metered API access). You actually pay the flat subscription fee.
+Every quota refresh writes a timestamped report to reports/. Calibration
+reads from that directory (your own samples), and optionally merges
+crowd_reports/ contributed via the public repo. Each report records
+tier, panel %s, per-model trailing-window token totals, and pricing
+snapshot date — so the picture stays accurate as Anthropic adjusts limits.
 
 Modes:
-  summary           (default) full breakdown: tokens · $-equivalent · % of session/week
-  quick             one-line totals (cheap to poll in a /loop)
-  agents            per-subagent attribution only
-  mark <name>       save a checkpoint at the current JSONL byte offset
-  since <name>      report delta since a saved checkpoint (for A/B comparisons)
+  summary           tokens + $ + % session/week + signals + calibration (default)
+  quick             one-line totals
+  agents            per-subagent attribution
+  mark <n> [--quota]   checkpoint at byte offset (optionally w/ quota snapshot)
+  since <n>         token + $ + quota delta since checkpoint
   marks             list saved checkpoints
-  drop <name>       delete a checkpoint
-  raw               dump aggregated counters as JSON
-  quota             refresh + show rolling 5h / 7d / Sonnet-only quota (tmux scrape, ~12s)
-  tier [<t>]        show/set subscription tier (pro | max5x | max20x)
-  sample            take a calibration sample (token count + quota %) for future estimates
-  calibrate         show calibration history + derived tokens-per-percent estimates
-  estimate          estimate current session/week % from the calibration model
+  drop <n>          delete a checkpoint
+  raw               JSON dump (for downstream tools)
+  quota             force-refresh quota panel (writes a report)
+  sample            alias for quota (kept for memory-file compatibility)
+  calibrate         show derived tokens-per-percent estimates from reports/
+  reports           list saved reports (own + crowd)
+  contribute        print anonymized JSON for sharing to public repo
+  tier [<t>]        show/set subscription tier (pro / max5x / max20x)
+
+Flags: --no-quota (skip quota refresh on summary), --crowd (merge community data)
 """
 
 import json
@@ -27,24 +33,27 @@ import os
 import re
 import sys
 import time
+import uuid
 import subprocess
 from pathlib import Path
+from datetime import datetime, timezone
 
+SCHEMA_VERSION = 1
 SKILL_DIR = Path(__file__).parent
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 MARKS_DIR = SKILL_DIR / "marks"
+REPORTS_DIR = SKILL_DIR / "reports"
+CROWD_DIR = SKILL_DIR / "crowd_reports"
 CONFIG_FILE = SKILL_DIR / "config.json"
 QUOTA_CACHE = SKILL_DIR / "quota_cache.json"
-CALIBRATION_FILE = SKILL_DIR / "calibration.json"
 CAPTURE_SH = SKILL_DIR / "capture.sh"
 
-QUOTA_CACHE_TTL_SECONDS = 600  # 10 min
+QUOTA_CACHE_TTL = 600  # 10 min
 
-# Anthropic API rates ($ per million tokens). Sourced from
+# Anthropic API rates ($ per million tokens). Source:
 # https://platform.claude.com/docs/en/docs/about-claude/pricing (verified 2026-05-17).
-# Update when Anthropic publishes new rates.
-# NOTE: Opus 4.5/4.6/4.7 are priced 1/3 of Opus 4.1 — the price cut took
-# effect with Opus 4.5. Do not assume Opus = $15/$75.
+# Opus 4.5+ pricing is 1/3 of Opus 4.1 — do NOT assume Opus = $15/$75.
+PRICING_DATE = "2026-05-17"
 RATES = {
     "claude-opus-4-7":     {"input":  5.00, "output": 25.00, "cache_read": 0.50, "cache_write_5m":  6.25, "cache_write_1h": 10.00},
     "claude-opus-4-6":     {"input":  5.00, "output": 25.00, "cache_read": 0.50, "cache_write_5m":  6.25, "cache_write_1h": 10.00},
@@ -55,10 +64,8 @@ RATES = {
     "claude-haiku-4-5":    {"input":  1.00, "output":  5.00, "cache_read": 0.10, "cache_write_5m":  1.25, "cache_write_1h":  2.00},
     "claude-haiku-3-5":    {"input":  0.80, "output":  4.00, "cache_read": 0.08, "cache_write_5m":  1.00, "cache_write_1h":  1.60},
 }
-# Fallback when we can't determine model (subagents). Sonnet is the default agent model.
 DEFAULT_RATE_KEY = "claude-sonnet-4-6"
 
-# Subagent type → assumed model for cost estimation.
 AGENT_TYPE_MODEL = {
     "Explore":         "claude-haiku-4-5",
     "general-purpose": "claude-sonnet-4-6",
@@ -66,14 +73,14 @@ AGENT_TYPE_MODEL = {
     "code-reviewer":   "claude-sonnet-4-6",
 }
 
-# Subscription tier metadata. Monthly_fee_usd is the headline price (for the
-# value-context line). Anthropic doesn't publish exact token caps, so we don't
-# claim them — calibration learns them empirically from /usage panel samples.
 TIERS = {
-    "pro":     {"name": "Pro",        "monthly_fee_usd":  20},
-    "max5x":   {"name": "Max 5x",     "monthly_fee_usd": 100},
-    "max20x":  {"name": "Max 20x",    "monthly_fee_usd": 200},
+    "pro":     {"name": "Pro",    "monthly_fee_usd":  20},
+    "max5x":   {"name": "Max 5x", "monthly_fee_usd": 100},
+    "max20x":  {"name": "Max 20x","monthly_fee_usd": 200},
 }
+
+# Skip "model" values that aren't real billable models
+SKIP_MODELS = {"<synthetic>", "synthetic", None, "", "unknown"}
 
 
 # ─────────────────────────── transcript parsing ───────────────────────────
@@ -84,45 +91,41 @@ def project_slug(path: Path) -> str:
 
 def current_session_jsonl(cwd: Path | None = None) -> Path | None:
     cwd = cwd or Path.cwd()
-    project_dir = PROJECTS_DIR / project_slug(cwd)
-    if not project_dir.exists():
-        return None
-    files = list(project_dir.glob("*.jsonl"))
+    p = PROJECTS_DIR / project_slug(cwd)
+    if not p.exists(): return None
+    files = list(p.glob("*.jsonl"))
     return max(files, key=lambda f: f.stat().st_mtime) if files else None
 
 
 def parse_records(path: Path, byte_offset: int = 0):
     with open(path, "rb") as f:
         if byte_offset:
-            f.seek(byte_offset)
-            f.readline()  # skip partial line
+            f.seek(byte_offset); f.readline()
         for raw in f:
-            try:
-                yield json.loads(raw)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
+            try: yield json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError): continue
+
+
+def ts_seconds(ts_str):
+    if not ts_str: return 0
+    try: return datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+    except: return 0
 
 
 def collect(records):
-    main = {
-        "turns": 0, "input_tokens": 0, "output_tokens": 0,
-        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
-        "ephemeral_1h": 0, "ephemeral_5m": 0,
-        "per_turn": [],
-        "by_model": {},  # model → {input, output, cache_read, cache_write_5m, cache_write_1h}
-    }
+    main = {"turns": 0, "input_tokens": 0, "output_tokens": 0,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            "ephemeral_1h": 0, "ephemeral_5m": 0, "per_turn": [], "by_model": {}}
     subagents = []
     tool_call_count = 0
-
     for r in records:
         rtype = r.get("type")
         ts = r.get("timestamp")
-
         if rtype == "assistant" and not r.get("isSidechain"):
             msg = r.get("message") or {}
             usage = msg.get("usage")
-            model = msg.get("model") or "unknown"
-            if usage:
+            model = msg.get("model")
+            if usage and model not in SKIP_MODELS:
                 main["turns"] += 1
                 in_t = usage.get("input_tokens", 0) or 0
                 out_t = usage.get("output_tokens", 0) or 0
@@ -150,13 +153,11 @@ def collect(records):
                 for block in msg.get("content") or []:
                     if isinstance(block, dict) and block.get("type") == "tool_use":
                         tool_call_count += 1
-
         if rtype == "user":
             tur = r.get("toolUseResult")
             if isinstance(tur, dict) and tur.get("agentType"):
                 u = tur.get("usage") or {}
                 cc = u.get("cache_creation") or {}
-                assumed_model = AGENT_TYPE_MODEL.get(tur.get("agentType"), DEFAULT_RATE_KEY)
                 subagents.append({
                     "ts": ts,
                     "agentType": tur.get("agentType") or "unknown",
@@ -172,28 +173,24 @@ def collect(records):
                     "toolUseCount": tur.get("totalToolUseCount", 0) or 0,
                     "prompt_preview": ((tur.get("prompt") or "")[:120]).replace("\n", " "),
                     "status": tur.get("status"),
-                    "assumed_model": assumed_model,
+                    "assumed_model": AGENT_TYPE_MODEL.get(tur.get("agentType"), DEFAULT_RATE_KEY),
                 })
-
     return main, subagents, tool_call_count
 
 
-# ─────────────────────────── cost calculation ───────────────────────────
+# ─────────────────────────── cost / weighting ───────────────────────────
 
 def rates_for(model: str) -> dict:
     return RATES.get(model, RATES[DEFAULT_RATE_KEY])
 
 
-def cost_of(usage_breakdown: dict, model: str) -> float:
-    """Dollar cost given a usage breakdown {input,output,cache_read,cache_write_5m,cache_write_1h}."""
+def cost_of(b: dict, model: str) -> float:
     r = rates_for(model)
-    return (
-        usage_breakdown.get("input", 0) * r["input"] / 1_000_000
-        + usage_breakdown.get("output", 0) * r["output"] / 1_000_000
-        + usage_breakdown.get("cache_read", 0) * r["cache_read"] / 1_000_000
-        + usage_breakdown.get("cache_write_5m", 0) * r["cache_write_5m"] / 1_000_000
-        + usage_breakdown.get("cache_write_1h", 0) * r["cache_write_1h"] / 1_000_000
-    )
+    return (b.get("input", 0) * r["input"]
+          + b.get("output", 0) * r["output"]
+          + b.get("cache_read", 0) * r["cache_read"]
+          + b.get("cache_write_5m", 0) * r["cache_write_5m"]
+          + b.get("cache_write_1h", 0) * r["cache_write_1h"]) / 1_000_000
 
 
 def main_cost(m: dict) -> float:
@@ -201,16 +198,65 @@ def main_cost(m: dict) -> float:
 
 
 def subagent_cost(s: dict) -> float:
-    return cost_of({
-        "input": s["input_tokens"],
-        "output": s["output_tokens"],
-        "cache_read": s["cache_read_input_tokens"],
-        "cache_write_5m": s["ephemeral_5m"],
-        "cache_write_1h": s["ephemeral_1h"],
-    }, s["assumed_model"])
+    return cost_of({"input": s["input_tokens"], "output": s["output_tokens"],
+                    "cache_read": s["cache_read_input_tokens"],
+                    "cache_write_5m": s["ephemeral_5m"],
+                    "cache_write_1h": s["ephemeral_1h"]}, s["assumed_model"])
 
 
-# ─────────────────────────── config / quota / calibration storage ───────────────────────────
+def weighted_input_equiv(b: dict, model: str) -> float:
+    r = rates_for(model)
+    return (b.get("input", 0)
+          + b.get("output", 0) * (r["output"] / r["input"])
+          + b.get("cache_read", 0) * (r["cache_read"] / r["input"])
+          + b.get("cache_write_5m", 0) * (r["cache_write_5m"] / r["input"])
+          + b.get("cache_write_1h", 0) * (r["cache_write_1h"] / r["input"]))
+
+
+# ─────────────────────────── window aggregation ───────────────────────────
+
+def tokens_in_window(jsonl: Path, window_seconds: float) -> dict:
+    """Sum per-model trailing-window token counts from the transcript."""
+    cutoff = time.time() - window_seconds
+    by_model = {}
+    for r in parse_records(jsonl):
+        rtype = r.get("type")
+        ts = ts_seconds(r.get("timestamp"))
+        if ts < cutoff: continue
+        if rtype == "assistant" and not r.get("isSidechain"):
+            msg = r.get("message") or {}
+            u = msg.get("usage")
+            model = msg.get("model")
+            if u and model not in SKIP_MODELS:
+                cc = u.get("cache_creation") or {}
+                bm = by_model.setdefault(model,
+                    {"input": 0, "output": 0, "cache_read": 0, "cache_write_5m": 0, "cache_write_1h": 0})
+                bm["input"] += u.get("input_tokens", 0) or 0
+                bm["output"] += u.get("output_tokens", 0) or 0
+                bm["cache_read"] += u.get("cache_read_input_tokens", 0) or 0
+                bm["cache_write_5m"] += cc.get("ephemeral_5m_input_tokens", 0) or 0
+                bm["cache_write_1h"] += cc.get("ephemeral_1h_input_tokens", 0) or 0
+        if rtype == "user":
+            tur = r.get("toolUseResult")
+            if isinstance(tur, dict) and tur.get("agentType"):
+                u = tur.get("usage") or {}
+                cc = u.get("cache_creation") or {}
+                model = AGENT_TYPE_MODEL.get(tur.get("agentType"), DEFAULT_RATE_KEY)
+                bm = by_model.setdefault(model,
+                    {"input": 0, "output": 0, "cache_read": 0, "cache_write_5m": 0, "cache_write_1h": 0})
+                bm["input"] += u.get("input_tokens", 0) or 0
+                bm["output"] += u.get("output_tokens", 0) or 0
+                bm["cache_read"] += u.get("cache_read_input_tokens", 0) or 0
+                bm["cache_write_5m"] += cc.get("ephemeral_5m_input_tokens", 0) or 0
+                bm["cache_write_1h"] += cc.get("ephemeral_1h_input_tokens", 0) or 0
+    raw_total = sum(sum(bm.values()) for bm in by_model.values())
+    weighted = sum(weighted_input_equiv(bm, mdl) for mdl, bm in by_model.items())
+    dollars = sum(cost_of(bm, mdl) for mdl, bm in by_model.items())
+    return {"by_model": by_model, "raw_total": raw_total,
+            "weighted_input_equiv": int(weighted), "dollars": round(dollars, 4)}
+
+
+# ─────────────────────────── config / cache / reports ───────────────────────────
 
 def load_config() -> dict:
     if CONFIG_FILE.exists():
@@ -224,6 +270,14 @@ def save_config(cfg: dict):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
 
+def get_or_mint_anon_id() -> str:
+    cfg = load_config()
+    if not cfg.get("anonymous_id"):
+        cfg["anonymous_id"] = str(uuid.uuid4())
+        save_config(cfg)
+    return cfg["anonymous_id"]
+
+
 def load_quota_cache() -> dict | None:
     if QUOTA_CACHE.exists():
         try: return json.loads(QUOTA_CACHE.read_text())
@@ -235,218 +289,144 @@ def save_quota_cache(data: dict):
     QUOTA_CACHE.write_text(json.dumps(data, indent=2))
 
 
-def load_calibration() -> dict:
-    if CALIBRATION_FILE.exists():
-        try: return json.loads(CALIBRATION_FILE.read_text())
-        except: pass
-    return {"samples": []}
+def save_report(report: dict) -> Path:
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    f = REPORTS_DIR / f"{stamp}.json"
+    f.write_text(json.dumps(report, indent=2))
+    return f
 
 
-def save_calibration(cal: dict):
-    CALIBRATION_FILE.write_text(json.dumps(cal, indent=2))
+def load_reports(include_crowd: bool = False) -> list[dict]:
+    reports = []
+    if REPORTS_DIR.exists():
+        for p in sorted(REPORTS_DIR.glob("*.json")):
+            try: reports.append(json.loads(p.read_text()))
+            except: pass
+    if include_crowd and CROWD_DIR.exists():
+        for p in sorted(CROWD_DIR.glob("*.json")):
+            try:
+                d = json.loads(p.read_text())
+                d["_crowd"] = True
+                reports.append(d)
+            except: pass
+    return reports
 
 
-# ─────────────────────────── quota panel capture + parse ───────────────────────────
+# ─────────────────────────── /usage panel capture ───────────────────────────
 
 def capture_quota_panel() -> str:
-    """Run capture.sh and return its stdout."""
-    result = subprocess.run(["bash", str(CAPTURE_SH)], capture_output=True, text=True, timeout=60)
-    return result.stdout
+    r = subprocess.run(["bash", str(CAPTURE_SH)], capture_output=True, text=True, timeout=60)
+    return r.stdout
 
 
 def parse_quota_panel(text: str) -> dict:
-    """Parse the /usage panel output for percentages and reset times."""
-    out = {
-        "session_pct": None, "session_reset": None,
-        "week_all_pct": None, "week_reset": None,
-        "week_sonnet_pct": None, "week_sonnet_reset": None,
-    }
+    out = {"session_pct": None, "session_reset": None,
+           "week_all_pct": None, "week_reset": None,
+           "week_sonnet_pct": None, "week_sonnet_reset": None}
     section = None
     for line in text.splitlines():
         s = line.strip()
-        if "Current session" in s:
-            section = "session"
-        elif "Current week (all models)" in s:
-            section = "week_all"
-        elif "Current week (Sonnet only)" in s:
-            section = "week_sonnet"
-        elif s.startswith("What's contributing") or s.startswith("Extra usage"):
-            section = None
-
+        if "Current session" in s: section = "session"
+        elif "Current week (all models)" in s: section = "week_all"
+        elif "Current week (Sonnet only)" in s: section = "week_sonnet"
+        elif s.startswith("What's contributing") or s.startswith("Extra usage"): section = None
         m = re.search(r"(\d+)%\s*used", s)
-        if m and section:
-            key = f"{section}_pct"
-            if out.get(key) is None:
-                out[key] = int(m.group(1))
-
+        if m and section and out.get(f"{section}_pct") is None:
+            out[f"{section}_pct"] = int(m.group(1))
         m2 = re.search(r"Resets\s+(.+?)\s*$", s)
         if m2 and section:
             key = "session_reset" if section == "session" else "week_reset" if section == "week_all" else "week_sonnet_reset"
-            if out.get(key) is None:
-                out[key] = m2.group(1).strip()
-
+            if out.get(key) is None: out[key] = m2.group(1).strip()
     return out
 
 
-def refresh_quota_if_stale(force: bool = False) -> dict | None:
-    """Returns the cached or freshly-captured quota panel data."""
+def refresh_quota(force: bool = False, write_report: bool = True, jsonl: Path | None = None) -> dict | None:
     cache = load_quota_cache()
     if cache and not force:
-        age = time.time() - cache.get("ts", 0)
-        if age < QUOTA_CACHE_TTL_SECONDS:
+        if time.time() - cache.get("ts", 0) < QUOTA_CACHE_TTL:
             return cache
     try:
-        panel_text = capture_quota_panel()
-        parsed = parse_quota_panel(panel_text)
+        text = capture_quota_panel()
+        parsed = parse_quota_panel(text)
         parsed["ts"] = time.time()
-        parsed["panel_text"] = panel_text
+        parsed["panel_text"] = text
         save_quota_cache(parsed)
+        if write_report and jsonl:
+            cfg = load_config()
+            tier_key = cfg.get("tier")
+            tier_info = TIERS.get(tier_key, {})
+            w5h = tokens_in_window(jsonl, 5 * 3600)
+            w7d = tokens_in_window(jsonl, 7 * 86400)
+            save_report({
+                "schema_version": SCHEMA_VERSION,
+                "timestamp_iso": datetime.now(timezone.utc).isoformat(),
+                "timestamp_local": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                "epoch": int(time.time()),
+                "tier": tier_key,
+                "tier_monthly_usd": tier_info.get("monthly_fee_usd"),
+                "anonymous_id": get_or_mint_anon_id(),
+                "pricing_snapshot_date": PRICING_DATE,
+                "panel": {k: parsed.get(k) for k in
+                          ("session_pct", "session_reset", "week_all_pct", "week_reset",
+                           "week_sonnet_pct", "week_sonnet_reset")},
+                "trailing_5h": w5h,
+                "trailing_7d": w7d,
+            })
         return parsed
-    except Exception as e:
-        if cache:
-            return cache  # stale is better than nothing
-        return None
+    except Exception:
+        return cache  # stale is better than nothing
 
 
-# ─────────────────────────── calibration: tokens-per-percent ───────────────────────────
+# ─────────────────────────── calibration ───────────────────────────
 
-def tokens_in_window(jsonl: Path, window_seconds: float) -> dict:
-    """Sum token usage from the transcript within the trailing window."""
-    cutoff = time.time() - window_seconds
-    totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
-              "raw_total": 0, "weighted": 0.0, "dollars": 0.0}
-
-    def ts_seconds(ts_str):
-        if not ts_str: return 0
-        try:
-            from datetime import datetime
-            return datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
-        except: return 0
-
-    for r in parse_records(jsonl):
-        rtype = r.get("type")
-        ts = ts_seconds(r.get("timestamp"))
-        if ts < cutoff:
-            continue
-
-        if rtype == "assistant" and not r.get("isSidechain"):
-            msg = r.get("message") or {}
-            usage = msg.get("usage")
-            model = msg.get("model") or "unknown"
-            if usage:
-                in_t = usage.get("input_tokens", 0) or 0
-                out_t = usage.get("output_tokens", 0) or 0
-                cr_t = usage.get("cache_read_input_tokens", 0) or 0
-                cw_t = usage.get("cache_creation_input_tokens", 0) or 0
-                cc = usage.get("cache_creation") or {}
-                e5m = cc.get("ephemeral_5m_input_tokens", 0) or 0
-                e1h = cc.get("ephemeral_1h_input_tokens", 0) or 0
-                totals["input"] += in_t
-                totals["output"] += out_t
-                totals["cache_read"] += cr_t
-                totals["cache_write"] += cw_t
-                totals["raw_total"] += in_t + out_t + cr_t + cw_t
-                # Weighted by API-rate ratios (input-equivalent units)
-                r_ = rates_for(model)
-                totals["weighted"] += in_t + out_t * (r_["output"]/r_["input"]) \
-                                     + cr_t * (r_["cache_read"]/r_["input"]) \
-                                     + e5m * (r_["cache_write_5m"]/r_["input"]) \
-                                     + e1h * (r_["cache_write_1h"]/r_["input"])
-                totals["dollars"] += cost_of({"input": in_t, "output": out_t, "cache_read": cr_t,
-                                              "cache_write_5m": e5m, "cache_write_1h": e1h}, model)
-
-        if rtype == "user":
-            tur = r.get("toolUseResult")
-            if isinstance(tur, dict) and tur.get("agentType"):
-                u = tur.get("usage") or {}
-                cc = u.get("cache_creation") or {}
-                in_t = u.get("input_tokens", 0) or 0
-                out_t = u.get("output_tokens", 0) or 0
-                cr_t = u.get("cache_read_input_tokens", 0) or 0
-                cw_t = u.get("cache_creation_input_tokens", 0) or 0
-                e5m = cc.get("ephemeral_5m_input_tokens", 0) or 0
-                e1h = cc.get("ephemeral_1h_input_tokens", 0) or 0
-                assumed = AGENT_TYPE_MODEL.get(tur.get("agentType"), DEFAULT_RATE_KEY)
-                r_ = rates_for(assumed)
-                totals["input"] += in_t
-                totals["output"] += out_t
-                totals["cache_read"] += cr_t
-                totals["cache_write"] += cw_t
-                totals["raw_total"] += in_t + out_t + cr_t + cw_t
-                totals["weighted"] += in_t + out_t * (r_["output"]/r_["input"]) \
-                                     + cr_t * (r_["cache_read"]/r_["input"]) \
-                                     + e5m * (r_["cache_write_5m"]/r_["input"]) \
-                                     + e1h * (r_["cache_write_1h"]/r_["input"])
-                totals["dollars"] += cost_of({"input": in_t, "output": out_t, "cache_read": cr_t,
-                                              "cache_write_5m": e5m, "cache_write_1h": e1h}, assumed)
-
-    return totals
+def median(xs):
+    xs = sorted(xs)
+    return xs[len(xs) // 2] if xs else None
 
 
-def take_calibration_sample(jsonl: Path) -> dict:
-    """Take a fresh quota sample + record the trailing-window token totals."""
-    quota = refresh_quota_if_stale(force=True)
-    if not quota:
-        raise RuntimeError("Could not capture /usage panel")
-    window_5h = tokens_in_window(jsonl, 5 * 3600)
-    window_7d = tokens_in_window(jsonl, 7 * 86400)
-    sample = {
-        "ts": time.time(),
-        "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "session_pct": quota.get("session_pct"),
-        "week_all_pct": quota.get("week_all_pct"),
-        "week_sonnet_pct": quota.get("week_sonnet_pct"),
-        "tokens_5h": window_5h,
-        "tokens_7d": window_7d,
+def slope_from_reports(reports: list[dict], pct_key: str, window_key: str,
+                       tier_filter: str | None = None) -> dict | None:
+    """Median of consecutive-pair slopes within same (anonymous_id, tier) group."""
+    samples = []
+    for r in reports:
+        if tier_filter and r.get("tier") != tier_filter: continue
+        pct = (r.get("panel") or {}).get(pct_key)
+        tokens = (r.get(window_key) or {}).get("weighted_input_equiv")
+        anon = r.get("anonymous_id", "anon")
+        epoch = r.get("epoch", 0)
+        if pct is None or tokens is None or pct <= 0: continue
+        samples.append({"anon": anon, "epoch": epoch, "pct": pct, "tokens": tokens})
+    if len(samples) < 2: return None
+    # Group by anon, sort by epoch within group, take consecutive slopes
+    by_anon = {}
+    for s in samples: by_anon.setdefault(s["anon"], []).append(s)
+    slopes = []
+    for grp in by_anon.values():
+        grp.sort(key=lambda x: x["epoch"])
+        for i in range(1, len(grp)):
+            dp = grp[i]["pct"] - grp[i-1]["pct"]
+            dt = grp[i]["tokens"] - grp[i-1]["tokens"]
+            if dp > 0 and dt > 0: slopes.append(dt / dp)
+    if not slopes:
+        # Single-sample fallback: tokens / pct (assumes linear from zero)
+        slopes = [s["tokens"] / s["pct"] for s in samples if s["pct"] > 0]
+    if not slopes: return None
+    m = median(slopes)
+    return {"tokens_per_percent": int(m), "est_full_capacity": int(m * 100),
+            "samples": len(samples), "slopes_used": len(slopes)}
+
+
+def calibration_estimates(include_crowd: bool = False, tier_filter: str | None = None) -> dict:
+    reports = load_reports(include_crowd=include_crowd)
+    return {
+        "report_count": len(reports),
+        "own_count": sum(1 for r in reports if not r.get("_crowd")),
+        "crowd_count": sum(1 for r in reports if r.get("_crowd")),
+        "session": slope_from_reports(reports, "session_pct", "trailing_5h", tier_filter),
+        "week_all": slope_from_reports(reports, "week_all_pct", "trailing_7d", tier_filter),
+        "week_sonnet": slope_from_reports(reports, "week_sonnet_pct", "trailing_7d", tier_filter),
     }
-    cal = load_calibration()
-    cal["samples"].append(sample)
-    # Keep last 50 samples (more than enough; older are stale anyway)
-    cal["samples"] = cal["samples"][-50:]
-    save_calibration(cal)
-    return sample
-
-
-def calibration_estimates() -> dict:
-    """Compute tokens-per-percent from sample history. Returns per-window estimates."""
-    cal = load_calibration()
-    samples = cal.get("samples", [])
-    out = {"samples": len(samples), "session": None, "week_all": None, "week_sonnet": None}
-    if len(samples) < 2:
-        return out
-
-    def estimate(key_pct, key_tokens, weighted=True):
-        # For each pair of samples (within the relevant window), compute slope
-        points = [(s[key_pct], s[key_tokens]["weighted" if weighted else "raw_total"])
-                  for s in samples if s.get(key_pct) is not None]
-        if len(points) < 2:
-            return None
-        # Use simplest estimator: (delta tokens) / (delta pct) across consecutive samples
-        slopes = []
-        for i in range(1, len(points)):
-            dp = points[i][0] - points[i-1][0]
-            dt = points[i][1] - points[i-1][1]
-            if dp > 0 and dt > 0:
-                slopes.append(dt / dp)
-        if not slopes:
-            # Fall back to single-sample estimate: tokens_in_window / pct
-            for pct, tokens in points:
-                if pct > 0:
-                    slopes.append(tokens / pct)
-        if not slopes:
-            return None
-        median_slope = sorted(slopes)[len(slopes) // 2]
-        return {
-            "tokens_per_percent": median_slope,
-            "est_full_capacity": median_slope * 100,
-            "samples_used": len(points),
-            "all_slopes": slopes,
-        }
-
-    out["session"] = estimate("session_pct", "tokens_5h")
-    out["week_all"] = estimate("week_all_pct", "tokens_7d")
-    out["week_sonnet"] = estimate("week_sonnet_pct", "tokens_7d")
-    return out
 
 
 # ─────────────────────────── formatting ───────────────────────────
@@ -465,8 +445,8 @@ def fmt_dollars(d: float) -> str:
     return f"${d:.4f}"
 
 
-def main_thread_total(m):
-    return m["input_tokens"] + m["output_tokens"] + m["cache_read_input_tokens"] + m["cache_creation_input_tokens"]
+def main_thread_total(m): return (m["input_tokens"] + m["output_tokens"]
+                                  + m["cache_read_input_tokens"] + m["cache_creation_input_tokens"])
 
 
 def cache_hit_pct(m):
@@ -474,27 +454,17 @@ def cache_hit_pct(m):
     return (m["cache_read_input_tokens"] / seen * 100) if seen else 0.0
 
 
+def new_tokens(m, subs):
+    """Unique content tokens (excludes cache_read replay). The 'actual work' number."""
+    main_new = m["input_tokens"] + m["output_tokens"] + m["cache_creation_input_tokens"]
+    sub_new = sum(s["input_tokens"] + s["output_tokens"] + s["cache_creation_input_tokens"] for s in subs)
+    return main_new + sub_new
+
+
 # ─────────────────────────── reports ───────────────────────────
 
-def quota_block(skip_refresh: bool = False) -> tuple[str, dict | None]:
-    """Return a multi-line string for the quota section + the parsed quota data."""
-    quota = refresh_quota_if_stale() if not skip_refresh else load_quota_cache()
-    if not quota:
-        return "  (quota panel unavailable — run `usage2 quota` to refresh)", None
-    age = time.time() - quota.get("ts", 0)
-    age_str = f"{int(age)}s ago" if age < 90 else f"{int(age/60)}min ago"
-    lines = []
-    if quota.get("session_pct") is not None:
-        lines.append(f"  Session (5h window):  {quota['session_pct']:3d}%   resets {quota.get('session_reset', '?')}")
-    if quota.get("week_all_pct") is not None:
-        lines.append(f"  Week (all models):    {quota['week_all_pct']:3d}%   resets {quota.get('week_reset', '?')}")
-    if quota.get("week_sonnet_pct") is not None:
-        lines.append(f"  Week (Sonnet only):   {quota['week_sonnet_pct']:3d}%   resets {quota.get('week_sonnet_reset', '?')}")
-    lines.append(f"  ({age_str})")
-    return "\n".join(lines), quota
-
-
-def report_summary(jsonl: Path, byte_offset: int = 0, label: str = "", skip_quota: bool = False):
+def report_summary(jsonl: Path, byte_offset: int = 0, label: str = "",
+                   skip_quota: bool = False, include_crowd: bool = False):
     records = list(parse_records(jsonl, byte_offset))
     m, subs, tool_calls = collect(records)
     main_total = main_thread_total(m)
@@ -503,196 +473,172 @@ def report_summary(jsonl: Path, byte_offset: int = 0, label: str = "", skip_quot
     m_cost = main_cost(m)
     s_cost = sum(subagent_cost(s) for s in subs)
     total_cost = m_cost + s_cost
+    nt = new_tokens(m, subs)
 
     cfg = load_config()
     tier = cfg.get("tier")
     tier_info = TIERS.get(tier) if tier else None
 
-    print(f"## Token usage{(' — ' + label) if label else ''}")
-    print(f"## Source: {jsonl}")
+    print(f"## /usage2 summary{(' — ' + label) if label else ''}")
     print()
-
     print("### Main thread")
     if m["turns"] == 0:
-        print("  (no completed turns yet in this range)")
+        print("  (no completed turns in this range)")
     else:
-        print(f"  Turns:              {m['turns']}")
-        print(f"  Tool calls issued:  {tool_calls}")
-        print(f"  Input (fresh):      {fmt(m['input_tokens'])}")
-        print(f"  Output:             {fmt(m['output_tokens'])}")
-        print(f"  Cache read:         {fmt(m['cache_read_input_tokens'])}  ({cache_hit_pct(m):.0f}% of all input)")
-        print(f"  Cache write:        {fmt(m['cache_creation_input_tokens'])}  (1h: {fmt(m['ephemeral_1h'])} · 5m: {fmt(m['ephemeral_5m'])})")
+        print(f"  Turns: {m['turns']}  ·  tool calls: {tool_calls}")
+        print(f"  Input (fresh):   {fmt(m['input_tokens']):>8}")
+        print(f"  Output:          {fmt(m['output_tokens']):>8}")
+        print(f"  Cache read:      {fmt(m['cache_read_input_tokens']):>8}  ({cache_hit_pct(m):.0f}% of all input)")
+        print(f"  Cache write:     {fmt(m['cache_creation_input_tokens']):>8}  (1h: {fmt(m['ephemeral_1h'])} · 5m: {fmt(m['ephemeral_5m'])})")
         if len(m["by_model"]) > 1:
-            for mdl, bm in sorted(m["by_model"].items(), key=lambda kv: -sum(kv[1].values()) + kv[1]["turns"]):
-                print(f"    {mdl}: {bm['turns']} turns · {fmt(bm['input']+bm['output']+bm['cache_read']+bm['cache_write_5m']+bm['cache_write_1h'])}")
-        print(f"  Main-thread total:  {fmt(main_total)}  ·  {fmt_dollars(m_cost)} API-equiv")
-        if m["turns"] >= 2:
-            avg_in = sum(t["in"] + t["cache_w"] for t in m["per_turn"]) // m["turns"]
-            avg_out = sum(t["out"] for t in m["per_turn"]) // m["turns"]
-            print(f"  Avg per turn:       in {fmt(avg_in)}, out {fmt(avg_out)}")
+            for mdl, bm in sorted(m["by_model"].items(), key=lambda kv: -kv[1]["turns"]):
+                print(f"    {mdl}: {bm['turns']} turns")
+        print(f"  Main-thread total:  {fmt(main_total)} tok  ·  {fmt_dollars(m_cost)} API-equiv")
     print()
 
     if subs:
-        print(f"### Subagents ({len(subs)} spawn{'s' if len(subs) != 1 else ''}, {fmt(sub_total)} tokens, {fmt_dollars(s_cost)})")
+        print(f"### Subagents ({len(subs)} spawns, {fmt(sub_total)} tok, {fmt_dollars(s_cost)})")
         by_type = {}
-        for s in subs:
-            by_type.setdefault(s["agentType"], []).append(s)
+        for s in subs: by_type.setdefault(s["agentType"], []).append(s)
         for t in sorted(by_type, key=lambda k: -sum(s["totalTokens"] for s in by_type[k])):
             spawns = by_type[t]
             tt = sum(s["totalTokens"] for s in spawns)
             tc = sum(subagent_cost(s) for s in spawns)
             print(f"  {t} × {len(spawns)} (assumed {AGENT_TYPE_MODEL.get(t, 'sonnet')}): {fmt(tt)} · {fmt_dollars(tc)}")
             for s in spawns:
-                pp = s["prompt_preview"][:80]
-                print(
-                    f"    └─ {fmt(s['totalTokens']):>6}  {fmt_dollars(subagent_cost(s)):>7}  "
-                    f"in {fmt(s['input_tokens'])}  out {fmt(s['output_tokens'])}  "
-                    f"cache-r {fmt(s['cache_read_input_tokens'])}  "
-                    f"{s['durationMs'] / 1000:.1f}s  {s['toolUseCount']} tools  \"{pp}…\""
-                )
+                pp = s["prompt_preview"][:70]
+                print(f"    └─ {fmt(s['totalTokens']):>6}  {fmt_dollars(subagent_cost(s)):>7}  "
+                      f"in {fmt(s['input_tokens'])} out {fmt(s['output_tokens'])} cache-r {fmt(s['cache_read_input_tokens'])}  "
+                      f"{s['durationMs']/1000:.0f}s  {s['toolUseCount']} tools  \"{pp}…\"")
         print()
 
-    print(f"### Grand total: {fmt(grand)} tokens · {fmt_dollars(total_cost)} API-equiv")
+    print(f"### Totals")
+    print(f"  Grand total (all categories):  {fmt(grand)} tok  ·  {fmt_dollars(total_cost)} API-equiv")
+    print(f"  New content tokens:            {fmt(nt)} tok    ← actual work (excludes cache_read replay)")
     if tier_info:
-        days_of_fee = total_cost / (tier_info["monthly_fee_usd"] / 30) if tier_info["monthly_fee_usd"] else 0
-        print(f"### Tier: {tier_info['name']} (${tier_info['monthly_fee_usd']}/mo)  →  this session = {days_of_fee:.1f} days of your subscription fee in API-equivalent value")
+        days = total_cost / (tier_info["monthly_fee_usd"] / 30) if tier_info["monthly_fee_usd"] else 0
+        print(f"  Tier: {tier_info['name']} (${tier_info['monthly_fee_usd']}/mo)  →  {days:.1f} days of subscription fee in API-equiv value")
     print()
 
     if not skip_quota:
-        print("### Rolling quota windows (from /usage panel)")
-        qblock, quota = quota_block()
-        print(qblock)
+        quota = refresh_quota(jsonl=jsonl)
+        print("### Rolling quota windows")
+        if not quota:
+            print("  (quota panel unavailable)")
+        else:
+            age = time.time() - quota.get("ts", 0)
+            age_str = f"{int(age)}s ago" if age < 90 else f"{int(age/60)}min ago"
+            if quota.get("session_pct") is not None:
+                print(f"  Session (5h):    {quota['session_pct']:3d}%   resets {quota.get('session_reset', '?')}")
+            if quota.get("week_all_pct") is not None:
+                print(f"  Week (all):      {quota['week_all_pct']:3d}%   resets {quota.get('week_reset', '?')}")
+            if quota.get("week_sonnet_pct") is not None:
+                print(f"  Week (Sonnet):   {quota['week_sonnet_pct']:3d}%   resets {quota.get('week_sonnet_reset', '?')}")
+            print(f"  ({age_str})")
         print()
 
-    # Calibration-derived estimates
-    cal_est = calibration_estimates()
-    if cal_est["samples"] >= 2:
-        print(f"### Calibration ({cal_est['samples']} samples in history)")
-        if cal_est["session"]:
-            cap = cal_est["session"]["est_full_capacity"]
-            print(f"  Session 5h capacity:    ~{fmt(cap)} weighted-input-equiv tokens  ({fmt(cal_est['session']['tokens_per_percent'])} per 1%)")
-        if cal_est["week_all"]:
-            cap = cal_est["week_all"]["est_full_capacity"]
-            print(f"  Week 7d capacity:       ~{fmt(cap)} weighted-input-equiv tokens  ({fmt(cal_est['week_all']['tokens_per_percent'])} per 1%)")
-        if cal_est["week_sonnet"]:
-            cap = cal_est["week_sonnet"]["est_full_capacity"]
-            print(f"  Week Sonnet capacity:   ~{fmt(cap)} weighted-input-equiv tokens  ({fmt(cal_est['week_sonnet']['tokens_per_percent'])} per 1%)")
-        print()
-    elif cal_est["samples"] == 1:
-        print(f"### Calibration: 1 sample (need ≥2 for slope estimate — run `usage2 sample` again later)")
-        print()
+    est = calibration_estimates(include_crowd=include_crowd, tier_filter=tier)
+    crowd_note = f" + {est['crowd_count']} crowd" if est['crowd_count'] else ""
+    print(f"### Calibration ({est['own_count']} own reports{crowd_note}{', tier=' + tier if tier else ''})")
+    if est["session"]:
+        e = est["session"]
+        print(f"  Session 5h capacity:    ~{fmt(e['est_full_capacity'])} weighted-input-equiv tok  ({fmt(e['tokens_per_percent'])} per 1%, {e['slopes_used']} slopes)")
     else:
-        print(f"### Calibration: no samples yet — run `usage2 sample` once now and again later to learn your tier's tokens-per-percent")
-        print()
+        print("  Session 5h:             (need ≥2 reports with delta)")
+    if est["week_all"]:
+        e = est["week_all"]
+        print(f"  Week 7d (all models):   ~{fmt(e['est_full_capacity'])} weighted-input-equiv tok  ({fmt(e['tokens_per_percent'])} per 1%, {e['slopes_used']} slopes)")
+    if est["week_sonnet"]:
+        e = est["week_sonnet"]
+        print(f"  Week 7d (Sonnet only):  ~{fmt(e['est_full_capacity'])} weighted-input-equiv tok  ({fmt(e['tokens_per_percent'])} per 1%, {e['slopes_used']} slopes)")
+    if not include_crowd and CROWD_DIR.exists() and any(CROWD_DIR.glob("*.json")):
+        print(f"  (Hint: pass --crowd to include {sum(1 for _ in CROWD_DIR.glob('*.json'))} community-contributed reports)")
+    print()
 
     if m["turns"] >= 3:
         print("### Efficiency signals")
         hit = cache_hit_pct(m)
         hit_note = "good context reuse" if hit > 80 else "low cache reuse — context may be churning" if hit < 50 else "moderate"
         print(f"  Cache hit ratio:       {hit:.0f}%   ({hit_note})")
-        out_in = (m["output_tokens"] / max(1, m["input_tokens"] + m["cache_creation_input_tokens"]))
+        out_in = m["output_tokens"] / max(1, m["input_tokens"] + m["cache_creation_input_tokens"])
         print(f"  Output / fresh input:  {out_in:.2f}x")
         if m["turns"] >= 4:
             recent = m["per_turn"][-3:]
-            growing = all(recent[i]["in"] + recent[i]["cache_w"] >= recent[i - 1]["in"] + recent[i - 1]["cache_w"] for i in range(1, len(recent)))
-            if growing:
-                print("  Trend:                 last 3 turns each grew (context bloat)")
+            growing = all(recent[i]["in"] + recent[i]["cache_w"] >= recent[i-1]["in"] + recent[i-1]["cache_w"]
+                          for i in range(1, len(recent)))
+            if growing: print("  Trend:                 last 3 turns each grew (context bloat)")
 
 
 def report_quick(jsonl: Path):
     records = list(parse_records(jsonl))
     m, subs, _ = collect(records)
-    main_total = main_thread_total(m)
-    sub_total = sum(s["totalTokens"] for s in subs)
+    grand = main_thread_total(m) + sum(s["totalTokens"] for s in subs)
     total_cost = main_cost(m) + sum(subagent_cost(s) for s in subs)
-    quota = load_quota_cache() or {}
-    sess = f"sess {quota.get('session_pct')}%" if quota.get("session_pct") is not None else "sess ?%"
-    week = f"week {quota.get('week_all_pct')}%" if quota.get("week_all_pct") is not None else "week ?%"
-    print(
-        f"{fmt(main_total + sub_total)} tok · {fmt_dollars(total_cost)} API · "
-        f"main {fmt(main_total)} ({m['turns']} turns) · subs {fmt(sub_total)} ({len(subs)}) · "
-        f"cache {cache_hit_pct(m):.0f}% · {sess} · {week}"
-    )
+    nt = new_tokens(m, subs)
+    q = load_quota_cache() or {}
+    sess = f"sess {q.get('session_pct')}%" if q.get("session_pct") is not None else "sess ?"
+    week = f"week {q.get('week_all_pct')}%" if q.get("week_all_pct") is not None else "week ?"
+    print(f"{fmt(grand)} tok ({fmt(nt)} new) · {fmt_dollars(total_cost)} · "
+          f"{m['turns']} turns · subs {len(subs)} · cache {cache_hit_pct(m):.0f}% · {sess} · {week}")
 
 
 def report_agents(jsonl: Path):
     records = list(parse_records(jsonl))
     _, subs, _ = collect(records)
-    if not subs:
-        print("(no subagent dispatches in this session yet)")
-        return
+    if not subs: print("(no subagent dispatches yet)"); return
     total = sum(s["totalTokens"] for s in subs)
     total_cost = sum(subagent_cost(s) for s in subs)
-    print(f"## Subagent attribution — {len(subs)} spawns, {fmt(total)} tokens, {fmt_dollars(total_cost)}")
-    print()
+    print(f"## Subagents — {len(subs)} spawns, {fmt(total)} tok, {fmt_dollars(total_cost)}")
     for i, s in enumerate(subs, 1):
         c = subagent_cost(s)
-        print(
-            f"{i}. {s['agentType']} (assumed {s['assumed_model']})  {fmt(s['totalTokens'])} tok · {fmt_dollars(c)}  "
-            f"(in {fmt(s['input_tokens'])} / out {fmt(s['output_tokens'])} / cache-r {fmt(s['cache_read_input_tokens'])})  "
-            f"{s['durationMs'] / 1000:.1f}s · {s['toolUseCount']} tools · {s['status']}"
-        )
+        print(f"{i}. {s['agentType']} (assumed {s['assumed_model']})  {fmt(s['totalTokens'])} tok · {fmt_dollars(c)}  "
+              f"({fmt(s['input_tokens'])} in / {fmt(s['output_tokens'])} out / {fmt(s['cache_read_input_tokens'])} cache-r)  "
+              f"{s['durationMs']/1000:.1f}s · {s['toolUseCount']} tools")
         print(f"   \"{s['prompt_preview']}…\"")
 
 
 def save_mark(name: str, jsonl: Path, capture_quota: bool = False):
     MARKS_DIR.mkdir(parents=True, exist_ok=True)
     size = jsonl.stat().st_size
-    mark = {
-        "name": name, "jsonl": str(jsonl),
-        "byte_offset": size, "timestamp": time.time(),
-        "iso_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    }
-    if capture_quota:
-        q = refresh_quota_if_stale(force=True)
-        mark["quota_at_mark"] = q
+    mark = {"name": name, "jsonl": str(jsonl), "byte_offset": size,
+            "timestamp": time.time(), "iso_time": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    if capture_quota: mark["quota_at_mark"] = refresh_quota(force=True, jsonl=jsonl)
     (MARKS_DIR / f"{name}.json").write_text(json.dumps(mark, indent=2))
-    print(f"Marked '{name}' at byte {size} in {jsonl.name}"
-          + (" (with quota snapshot)" if capture_quota else ""))
+    print(f"Marked '{name}' at byte {size} in {jsonl.name}" + (" (+ quota snapshot)" if capture_quota else ""))
 
 
 def load_mark(name: str):
     f = MARKS_DIR / f"{name}.json"
     if not f.exists():
         existing = [p.stem for p in MARKS_DIR.glob("*.json")] if MARKS_DIR.exists() else []
-        print(f"ERR: no mark named '{name}'. Existing: {existing or '(none)'}", file=sys.stderr)
-        sys.exit(1)
+        print(f"ERR: no mark '{name}'. Existing: {existing or '(none)'}", file=sys.stderr); sys.exit(1)
     return json.loads(f.read_text())
 
 
 def report_raw(jsonl: Path, byte_offset: int = 0):
     records = list(parse_records(jsonl, byte_offset))
     m, subs, tool_calls = collect(records)
-    quota = load_quota_cache()
-    cfg = load_config()
-    cal_est = calibration_estimates()
-    out = {
+    print(json.dumps({
         "source": str(jsonl),
-        "config": cfg,
-        "main_thread": {
-            "turns": m["turns"],
-            "tool_calls_issued": tool_calls,
-            "input_tokens": m["input_tokens"],
-            "output_tokens": m["output_tokens"],
-            "cache_read_input_tokens": m["cache_read_input_tokens"],
-            "cache_creation_input_tokens": m["cache_creation_input_tokens"],
-            "total_tokens": main_thread_total(m),
-            "cache_hit_pct": round(cache_hit_pct(m), 1),
-            "dollars_api_equiv": round(main_cost(m), 4),
-            "by_model": m["by_model"],
-        },
+        "config": load_config(),
+        "main_thread": {**{k: m[k] for k in
+                           ("turns", "input_tokens", "output_tokens",
+                            "cache_read_input_tokens", "cache_creation_input_tokens")},
+                        "tool_calls_issued": tool_calls,
+                        "total_tokens": main_thread_total(m),
+                        "cache_hit_pct": round(cache_hit_pct(m), 1),
+                        "dollars_api_equiv": round(main_cost(m), 4),
+                        "by_model": m["by_model"]},
         "subagents": [{**s, "dollars_api_equiv": round(subagent_cost(s), 4)} for s in subs],
         "subagent_total_tokens": sum(s["totalTokens"] for s in subs),
         "subagent_total_dollars": round(sum(subagent_cost(s) for s in subs), 4),
         "grand_total_tokens": main_thread_total(m) + sum(s["totalTokens"] for s in subs),
+        "new_content_tokens": new_tokens(m, subs),
         "grand_total_dollars": round(main_cost(m) + sum(subagent_cost(s) for s in subs), 4),
-        "quota": quota,
-        "calibration": cal_est,
-    }
-    print(json.dumps(out, indent=2, default=str))
+        "quota": load_quota_cache(),
+        "calibration": calibration_estimates(),
+    }, indent=2, default=str))
 
-
-# ─────────────────────────── entry point ───────────────────────────
 
 def cmd_tier(args):
     cfg = load_config()
@@ -702,140 +648,165 @@ def cmd_tier(args):
             ti = TIERS[cur]
             print(f"Current tier: {cur} ({ti['name']}, ${ti['monthly_fee_usd']}/mo)")
         else:
-            print("No tier set. Run `usage2 tier <pro|max5x|max20x>` to set.")
-            print("Available tiers:")
+            print("No tier set. Run `usage2 tier <pro|max5x|max20x>`.")
             for k, v in TIERS.items():
                 print(f"  {k:<8}  {v['name']:<10}  ${v['monthly_fee_usd']}/mo")
         return
     t = args[0].lower()
     if t not in TIERS:
-        print(f"ERR: unknown tier '{t}'. Choose from: {list(TIERS.keys())}", file=sys.stderr)
-        sys.exit(1)
-    cfg["tier"] = t
-    save_config(cfg)
+        print(f"ERR: unknown tier '{t}'. Choose from: {list(TIERS.keys())}", file=sys.stderr); sys.exit(1)
+    cfg["tier"] = t; save_config(cfg)
     ti = TIERS[t]
     print(f"Tier set to: {t} ({ti['name']}, ${ti['monthly_fee_usd']}/mo)")
 
 
-def cmd_calibrate():
-    cal = load_calibration()
-    samples = cal.get("samples", [])
-    if not samples:
-        print("No calibration samples yet. Run `usage2 sample` to record one.")
-        return
-    print(f"## Calibration history ({len(samples)} samples)")
+def cmd_calibrate(args):
+    include_crowd = "--crowd" in args
+    cfg = load_config()
+    tier = cfg.get("tier")
+    reports = load_reports(include_crowd=include_crowd)
+    print(f"## Calibration  ({len(reports)} reports{', tier filter=' + tier if tier else ''}{', incl. crowd' if include_crowd else ''})")
     print()
-    for s in samples:
-        sp = s.get("session_pct")
-        wp = s.get("week_all_pct")
-        ws = s.get("week_sonnet_pct")
-        t5 = s.get("tokens_5h", {}).get("weighted", 0)
-        t7 = s.get("tokens_7d", {}).get("weighted", 0)
-        print(f"  {s['iso']}  session {sp}%  week {wp}%  sonnet-week {ws}%  ·  5h-tokens {fmt(t5)}  7d-tokens {fmt(t7)}")
-    print()
-    print("## Derived estimates")
-    est = calibration_estimates()
+    own = [r for r in reports if not r.get("_crowd")]
+    if own:
+        print("### Own reports")
+        for r in own[-10:]:
+            ts = r.get("timestamp_local", r.get("timestamp_iso", "?"))
+            p = r.get("panel", {})
+            t5 = (r.get("trailing_5h") or {}).get("weighted_input_equiv", 0)
+            print(f"  {ts}  tier={r.get('tier','?')}  sess {p.get('session_pct')}%  week {p.get('week_all_pct')}%  son {p.get('week_sonnet_pct')}%  ·  5h-w {fmt(t5)}")
+        if len(own) > 10: print(f"  …({len(own) - 10} older)")
+        print()
+    crowd = [r for r in reports if r.get("_crowd")]
+    if crowd:
+        print(f"### Crowd reports ({len(crowd)})")
+        by_tier = {}
+        for r in crowd: by_tier.setdefault(r.get("tier", "?"), []).append(r)
+        for t, rs in sorted(by_tier.items()):
+            print(f"  {t}: {len(rs)} reports")
+        print()
+    est = calibration_estimates(include_crowd=include_crowd, tier_filter=tier)
+    print("### Derived estimates" + (" (your tier only)" if tier else ""))
     for w in ("session", "week_all", "week_sonnet"):
         e = est.get(w)
         if e is None:
-            print(f"  {w:<14}  (need ≥2 samples)")
+            print(f"  {w:<14}  (need ≥2 reports with delta)")
         else:
-            print(f"  {w:<14}  {fmt(e['tokens_per_percent'])} tokens / 1%  →  full capacity ~{fmt(e['est_full_capacity'])} weighted-input-equiv")
+            print(f"  {w:<14}  {fmt(e['tokens_per_percent']):>10}/1%  ·  full ~{fmt(e['est_full_capacity'])}  ·  {e['slopes_used']} slopes from {e['samples']} samples")
 
+
+def cmd_reports():
+    reports = load_reports(include_crowd=True)
+    own = [r for r in reports if not r.get("_crowd")]
+    crowd = [r for r in reports if r.get("_crowd")]
+    print(f"Own reports:   {len(own)} in {REPORTS_DIR}")
+    print(f"Crowd reports: {len(crowd)} in {CROWD_DIR}")
+    if own:
+        oldest = own[0].get("timestamp_local", "?")
+        newest = own[-1].get("timestamp_local", "?")
+        print(f"  Own range: {oldest} → {newest}")
+
+
+def cmd_contribute(jsonl: Path):
+    """Generate an anonymized report blob for sharing to the public repo."""
+    reports = load_reports(include_crowd=False)
+    if not reports:
+        # Take a fresh one
+        refresh_quota(force=True, jsonl=jsonl, write_report=True)
+        reports = load_reports(include_crowd=False)
+        if not reports:
+            print("ERR: no reports to contribute. Run `usage2 quota` first.", file=sys.stderr); sys.exit(1)
+    # Bundle: all of this user's reports, stripped of any identifying info beyond anon UUID + tier
+    bundle = {
+        "schema_version": SCHEMA_VERSION,
+        "contributed_at": datetime.now(timezone.utc).isoformat(),
+        "report_count": len(reports),
+        "reports": [{k: v for k, v in r.items() if k != "panel_text"} for r in reports],
+    }
+    print("## Anonymized contribution bundle")
+    print("## To contribute: save this JSON as `crowd_reports/<your-anon-id>.json`")
+    print("## in https://github.com/Loringtonian/usage2 and open a PR.")
+    print()
+    print(json.dumps(bundle, indent=2, default=str))
+
+
+# ─────────────────────────── entry ───────────────────────────
 
 def main():
     args = sys.argv[1:]
-    mode = args[0] if args else "summary"
-    rest = args[1:]
+    flags = {a for a in args if a.startswith("--")}
+    pos = [a for a in args if not a.startswith("--")]
+    mode = pos[0] if pos else "summary"
+    rest = pos[1:]
+    skip_quota = "--no-quota" in flags
+    include_crowd = "--crowd" in flags
 
-    if mode in ("tier",):
-        cmd_tier(rest)
-        return
+    if mode == "tier":
+        cmd_tier(rest); return
     if mode == "calibrate":
-        cmd_calibrate()
-        return
-
-    if mode == "quota":
-        q = refresh_quota_if_stale(force=True)
-        if q:
-            print(q.get("panel_text", "(no panel text)"))
-            print()
-            print("── parsed ──")
-            print(f"session: {q.get('session_pct')}%   resets {q.get('session_reset')}")
-            print(f"week_all: {q.get('week_all_pct')}%   resets {q.get('week_reset')}")
-            print(f"week_sonnet: {q.get('week_sonnet_pct')}%   resets {q.get('week_sonnet_reset')}")
-        else:
-            print("ERR: could not capture /usage panel", file=sys.stderr)
-            sys.exit(1)
-        return
+        cmd_calibrate(args); return
+    if mode == "reports":
+        cmd_reports(); return
 
     jsonl = current_session_jsonl()
-    if not jsonl and mode not in ("marks", "drop"):
-        slug = project_slug(Path.cwd())
-        print(f"ERR: no JSONL found for project slug '{slug}'", file=sys.stderr)
-        print(f"    expected dir: {PROJECTS_DIR / slug}", file=sys.stderr)
-        sys.exit(1)
+    if not jsonl and mode not in ("marks", "drop", "quota", "sample"):
+        print(f"ERR: no JSONL for cwd slug '{project_slug(Path.cwd())}'", file=sys.stderr); sys.exit(1)
+
+    if mode in ("quota", "sample"):
+        q = refresh_quota(force=True, write_report=True, jsonl=jsonl)
+        if q:
+            print(q.get("panel_text", ""))
+            print("── parsed ──")
+            print(f"session:     {q.get('session_pct')}%   resets {q.get('session_reset')}")
+            print(f"week_all:    {q.get('week_all_pct')}%   resets {q.get('week_reset')}")
+            print(f"week_sonnet: {q.get('week_sonnet_pct')}%   resets {q.get('week_sonnet_reset')}")
+            latest = sorted(REPORTS_DIR.glob("*.json"))[-1] if REPORTS_DIR.exists() and any(REPORTS_DIR.glob("*.json")) else None
+            if latest: print(f"\nReport saved: {latest.name}")
+        else:
+            print("ERR: capture failed", file=sys.stderr); sys.exit(1)
+        return
+
+    if mode == "contribute":
+        cmd_contribute(jsonl); return
 
     if mode == "summary":
-        report_summary(jsonl)
-    elif mode == "summary-fast":
-        report_summary(jsonl, skip_quota=True)
+        report_summary(jsonl, skip_quota=skip_quota, include_crowd=include_crowd)
     elif mode == "quick":
         report_quick(jsonl)
     elif mode == "agents":
         report_agents(jsonl)
     elif mode == "raw":
         report_raw(jsonl)
-    elif mode == "sample":
-        s = take_calibration_sample(jsonl)
-        print(f"Sample recorded at {s['iso']}: session {s['session_pct']}%, week {s['week_all_pct']}%, sonnet-week {s['week_sonnet_pct']}%")
-        print(f"  trailing-5h weighted-input-equiv: {fmt(s['tokens_5h']['weighted'])}")
-        print(f"  trailing-7d weighted-input-equiv: {fmt(s['tokens_7d']['weighted'])}")
-        est = calibration_estimates()
-        if est["samples"] >= 2:
-            print(f"  Now {est['samples']} samples — derived estimates available via `usage2 calibrate`.")
-        else:
-            print("  Run `usage2 sample` again later (15+ min apart) to derive slopes.")
     elif mode == "mark":
-        if len(rest) < 1:
-            print("Usage: usage2 mark <name> [--quota]", file=sys.stderr); sys.exit(1)
-        save_mark(rest[0], jsonl, capture_quota=("--quota" in rest))
+        if not rest: print("Usage: usage2 mark <name> [--quota]", file=sys.stderr); sys.exit(1)
+        save_mark(rest[0], jsonl, capture_quota="--quota" in flags)
     elif mode == "since":
-        if len(rest) < 1:
-            print("Usage: usage2 since <name>", file=sys.stderr); sys.exit(1)
+        if not rest: print("Usage: usage2 since <name>", file=sys.stderr); sys.exit(1)
         mk = load_mark(rest[0])
         report_summary(Path(mk["jsonl"]), byte_offset=mk["byte_offset"],
-                       label=f"since '{mk['name']}' ({mk['iso_time']})")
+                       label=f"since '{mk['name']}' ({mk['iso_time']})", skip_quota=skip_quota,
+                       include_crowd=include_crowd)
         if mk.get("quota_at_mark"):
-            print()
-            print("### Quota delta since mark")
-            now_q = refresh_quota_if_stale()
-            mk_q = mk["quota_at_mark"]
-            for key, label in [("session_pct", "Session"), ("week_all_pct", "Week (all)"), ("week_sonnet_pct", "Week (Sonnet)")]:
-                a = mk_q.get(key); b = now_q.get(key) if now_q else None
+            now_q = refresh_quota(jsonl=jsonl)
+            print("### Quota Δ since mark")
+            for key, label in (("session_pct", "Session"), ("week_all_pct", "Week (all)"), ("week_sonnet_pct", "Week (Sonnet)")):
+                a = mk["quota_at_mark"].get(key); b = now_q.get(key) if now_q else None
                 if a is not None and b is not None:
-                    delta = b - a
-                    sign = "+" if delta >= 0 else ""
-                    print(f"  {label:<14}  {a}% → {b}%  ({sign}{delta} pp)")
+                    d = b - a; sign = "+" if d >= 0 else ""
+                    print(f"  {label:<14}  {a}% → {b}%  ({sign}{d} pp)")
     elif mode == "marks":
-        if not MARKS_DIR.exists():
-            print("(no marks saved)"); return
-        for m in sorted(MARKS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime):
-            d = json.loads(m.read_text())
-            quota_note = " [w/quota]" if d.get("quota_at_mark") else ""
-            print(f"  {d['name']:<24}  {d['iso_time']}  (byte {d['byte_offset']}){quota_note}")
+        if not MARKS_DIR.exists(): print("(no marks)"); return
+        for f in sorted(MARKS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime):
+            d = json.loads(f.read_text())
+            note = " [+quota]" if d.get("quota_at_mark") else ""
+            print(f"  {d['name']:<24}  {d['iso_time']}  (byte {d['byte_offset']}){note}")
     elif mode == "drop":
-        if len(rest) < 1:
-            print("Usage: usage2 drop <name>", file=sys.stderr); sys.exit(1)
+        if not rest: print("Usage: usage2 drop <name>", file=sys.stderr); sys.exit(1)
         f = MARKS_DIR / f"{rest[0]}.json"
-        if f.exists():
-            f.unlink(); print(f"Dropped '{rest[0]}'")
-        else:
-            print(f"No mark '{rest[0]}'", file=sys.stderr); sys.exit(1)
+        if f.exists(): f.unlink(); print(f"Dropped '{rest[0]}'")
+        else: print(f"No mark '{rest[0]}'", file=sys.stderr); sys.exit(1)
     else:
-        print(f"Unknown mode: {mode}", file=sys.stderr)
-        print(__doc__, file=sys.stderr)
-        sys.exit(1)
+        print(f"Unknown mode: {mode}", file=sys.stderr); print(__doc__, file=sys.stderr); sys.exit(1)
 
 
 if __name__ == "__main__":
