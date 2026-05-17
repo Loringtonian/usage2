@@ -49,6 +49,7 @@ QUOTA_CACHE = SKILL_DIR / "quota_cache.json"
 CAPTURE_SH = SKILL_DIR / "capture.sh"
 
 QUOTA_CACHE_TTL = 600  # 10 min
+CONTAMINATION_THRESHOLD_USD = 5.0  # concurrent activity above this flags a report as contaminated
 
 # Anthropic API rates ($ per million tokens). Source:
 # https://platform.claude.com/docs/en/docs/about-claude/pricing (verified 2026-05-17).
@@ -398,6 +399,10 @@ def refresh_quota(force: bool = False, write_report: bool = True, jsonl: Path | 
             session_7d = tokens_in_window(jsonl, 7 * 86400)
             account_5h = tokens_in_window([jsonl] + others_5h, 5 * 3600)
             account_7d = tokens_in_window([jsonl] + others_7d, 7 * 86400)
+            # Concurrent contamination: sum of dollar consumption from OTHER sessions
+            concurrent_5h_dollars = round(sum(tokens_in_window(o, 5 * 3600)["dollars"] for o in others_5h), 4)
+            concurrent_7d_dollars = round(sum(tokens_in_window(o, 7 * 86400)["dollars"] for o in others_7d), 4)
+            contaminated = concurrent_5h_dollars > CONTAMINATION_THRESHOLD_USD
             # Top-level dollars/weighted = account scope (for calibration use)
             save_report({
                 "schema_version": SCHEMA_VERSION,
@@ -415,6 +420,10 @@ def refresh_quota(force: bool = False, write_report: bool = True, jsonl: Path | 
                 "trailing_7d": {**account_7d, "session_scope": session_7d},
                 "concurrent_5h": [p.stem for p in others_5h],
                 "concurrent_7d": [p.stem for p in others_7d],
+                "concurrent_5h_dollars": concurrent_5h_dollars,
+                "concurrent_7d_dollars": concurrent_7d_dollars,
+                "contaminated": contaminated,
+                "contamination_threshold_usd": CONTAMINATION_THRESHOLD_USD,
             })
         return parsed
     except Exception:
@@ -439,21 +448,29 @@ def slope_from_reports(reports: list[dict], pct_key: str, window_key: str,
     Falls back to legacy `weighted_input_equiv` for old reports without dollars.
     """
     samples = []
+    contaminated_skipped = 0
+    legacy_skipped = 0
     for r in reports:
         if tier_filter and r.get("tier") != tier_filter: continue
+        # Skip contaminated reports (concurrent activity > threshold)
+        if r.get("contaminated") is True:
+            contaminated_skipped += 1
+            continue
+        # Skip legacy reports without contamination tracking — can't trust their dollars
+        if r.get("contaminated") is None and "concurrent_5h_dollars" not in r:
+            legacy_skipped += 1
+            continue
         pct = (r.get("panel") or {}).get(pct_key)
         win = r.get(window_key) or {}
         value = win.get("dollars")
-        if value is None:
-            # Legacy reports stored only weighted_input_equiv — convert it back to
-            # dollars approximately by assuming Opus rate (close enough for slope ratios).
-            w = win.get("weighted_input_equiv")
-            value = w * 5.0 / 1_000_000 if w is not None else None
         anon = r.get("anonymous_id", "anon")
         epoch = r.get("epoch", 0)
         if pct is None or value is None or pct <= 0: continue
         samples.append({"anon": anon, "epoch": epoch, "pct": pct, "dollars": value})
-    if len(samples) < 2: return None
+    if len(samples) < 2:
+        if contaminated_skipped or legacy_skipped:
+            return {"insufficient": True, "contaminated_skipped": contaminated_skipped, "legacy_skipped": legacy_skipped}
+        return None
     by_anon = {}
     for s in samples: by_anon.setdefault(s["anon"], []).append(s)
     slopes = []
@@ -618,8 +635,15 @@ def report_summary(jsonl: Path, byte_offset: int = 0, label: str = "",
         print()
 
     est = calibration_estimates(include_crowd=include_crowd, tier_filter=tier)
+    all_reports = load_reports(include_crowd=include_crowd)
+    clean = sum(1 for r in all_reports if r.get("contaminated") is False)
+    contam = sum(1 for r in all_reports if r.get("contaminated") is True)
+    legacy = sum(1 for r in all_reports if r.get("contaminated") is None and "concurrent_5h_dollars" not in r)
     crowd_note = f" + {est['crowd_count']} crowd" if est['crowd_count'] else ""
-    print(f"### Calibration ({est['own_count']} own reports{crowd_note}{', tier=' + tier if tier else ''})")
+    parts = [f"{clean} clean"]
+    if contam: parts.append(f"{contam} contaminated")
+    if legacy: parts.append(f"{legacy} legacy/no-contamination-data")
+    print(f"### Calibration ({', '.join(parts)}{crowd_note}{', tier=' + tier if tier else ''})")
 
     def per_model_input_for(dollars_per_pct: float) -> str:
         """Show how many input tokens of each model 1% of quota allows."""
@@ -632,11 +656,16 @@ def report_summary(jsonl: Path, byte_offset: int = 0, label: str = "",
 
     def print_window(name: str, e: dict | None):
         if e is None:
-            print(f"  {name:<24} (need ≥2 reports with delta)")
+            print(f"  {name:<24} (need ≥2 clean reports with delta)")
+            return
+        if e.get("insufficient"):
+            skipped = f"{e.get('contaminated_skipped', 0)} contaminated"
+            if e.get("legacy_skipped"): skipped += f", {e['legacy_skipped']} legacy"
+            print(f"  {name:<24} (need ≥2 clean reports — {skipped} skipped)")
             return
         d_pct = e["dollars_per_percent"]
         cap = e["est_full_capacity_dollars"]
-        print(f"  {name:<24} 1% ≈ {fmt_dollars(d_pct)}  ·  100% ≈ {fmt_dollars(cap)}  ·  {e['slopes_used']} slopes from {e['samples']} samples")
+        print(f"  {name:<24} 1% ≈ {fmt_dollars(d_pct)}  ·  100% ≈ {fmt_dollars(cap)}  ·  {e['slopes_used']} slopes from {e['samples']} clean samples")
         print(f"  {' ':<24}   per 1% in pure-input tokens: {per_model_input_for(d_pct)}")
 
     print_window("Session 5h:",         est["session"])
@@ -786,6 +815,23 @@ def cmd_calibrate(args):
             print(f"  {w:<14}  {fmt(e['tokens_per_percent']):>10}/1%  ·  full ~{fmt(e['est_full_capacity'])}  ·  {e['slopes_used']} slopes from {e['samples']} samples")
 
 
+def cmd_reset_calibration():
+    """Archive all existing reports to reports_archive/<timestamp>/ for a fresh start."""
+    if not REPORTS_DIR.exists() or not any(REPORTS_DIR.glob("*.json")):
+        print("No reports to archive."); return
+    archive_root = SKILL_DIR / "reports_archive"
+    archive_root.mkdir(exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    target = archive_root / stamp
+    target.mkdir()
+    count = 0
+    for f in REPORTS_DIR.glob("*.json"):
+        f.rename(target / f.name)
+        count += 1
+    print(f"Archived {count} reports to {target}")
+    print("Calibration is now empty. Run `usage2 sample` (with no concurrent agents for cleanest results) to start fresh.")
+
+
 def cmd_reports():
     reports = load_reports(include_crowd=True)
     own = [r for r in reports if not r.get("_crowd")]
@@ -838,6 +884,8 @@ def main():
         cmd_calibrate(args); return
     if mode == "reports":
         cmd_reports(); return
+    if mode == "reset-calibration":
+        cmd_reset_calibration(); return
 
     jsonl = current_session_jsonl()
     if not jsonl and mode not in ("marks", "drop", "quota", "sample"):
