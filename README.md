@@ -145,7 +145,9 @@ Each sample stores `(quota %, trailing-5h dollars, trailing-7d dollars)`. With �
 - **`calibrate`** uses *only* reports where the account was single-instance during sampling. Cleanest signal, but you may have zero usable reports if you typically run multiple Claude Code sessions.
 - **`calibrate-account-scope`** uses **all** chronologically-adjacent report pairs, including contaminated ones. Premise: panel %s reflect account-wide consumption, so account-scope dollars vs. account-scope panel-Δ is valid regardless of how many concurrent sessions ran. Strongly recommended if you run multiple sessions.
 
-**Empirical caps** (Max 20x on 2026-05-18) from a controlled 3-stage experiment:
+**Empirical caps** (Max 20x on 2026-05-18) from a controlled 3-stage experiment. ⚠ The v1 numbers below have been superseded by [`research/per_model_cost_v2.md`](research/per_model_cost_v2.md) — v2 found that subagent-based per-model isolation is structurally impossible, and the real caps are likely **2-4× higher** than these (provisional range $337-$730 session, midpoint ~$500). Use v2 numbers when planning.
+
+v1 numbers (under-estimate):
 
 | Window | $/pp | Cap | 
 |---|---|---|

@@ -34,7 +34,6 @@ Modes:
 | Mode                | Purpose                                                          | Cost   |
 |---------------------|------------------------------------------------------------------|--------|
 | `summary` (default) | Tokens + $ + % session + % week + calibration + signals          | ~12s\* |
-| `summary-fast`      | Same but skip quota refresh (use cached %)                       | ~10ms  |
 | `quick`             | One-line: tokens · $ · cache% · session% · week%                 | ~10ms  |
 | `agents`            | Per-subagent attribution: agentType, $, prompt preview           | ~10ms  |
 | `mark <name>` `[--quota]` | Save a checkpoint, optionally with a quota snapshot        | ~10ms / ~12s |
@@ -45,6 +44,9 @@ Modes:
 | `quota`             | Force-refresh quota panel + show parsed result                   | ~12s   |
 | `sample`            | Take a calibration sample (forces quota capture)                 | ~12s   |
 | `calibrate`         | Show calibration history + derived tokens-per-percent estimates  | ~1ms   |
+| `calibrate-account-scope` | Consecutive-pair $/pp slopes from short-interval samples   | ~1ms   |
+| `estimate` `--model <m> --tokens <N>` | $ + est. session/week % impact for a planned action | ~1ms   |
+| `reset-calibration` | Archive all reports to `reports_archive/<timestamp>/`            | ~10ms  |
 | `tier [<t>]`        | Show or set subscription tier (pro / max5x / max20x)             | ~1ms   |
 
 \* The cached quota result is reused for 10 minutes, so consecutive `summary` calls within that window are ~10ms.

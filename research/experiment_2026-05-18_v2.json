@@ -1,0 +1,102 @@
+{
+  "experiment_date": "2026-05-18",
+  "version": 2,
+  "supersedes": "experiment_2026-05-18.json",
+  "experiment_title": "Per-model cost vs panel-% (v2 — controlled re-run with foreground dispatch + bigger stages)",
+  "tier": "max20x",
+  "platform": "Claude Code, Max 20x subscription, macOS Darwin 24.6.0",
+  "key_finding": "Subagent-based per-model isolation is structurally impossible for /usage2 attribution because subagent returns become parent cache_write_1h at Opus rates. Both Stage 1 (Haiku-targeted) and Stage 2 (Sonnet-targeted) ended up 97-98% Opus-dominated. H1 vs H2 cannot be tested with this protocol.",
+  "stages": [
+    {
+      "stage": 0,
+      "label": "v2 baseline (clean conditions)",
+      "timestamp_iso": "2026-05-18T17:23:13",
+      "epoch": 1779117793,
+      "panel": {"session_pct": 18, "week_all_pct": 17, "week_sonnet_pct": 15},
+      "trailing_5h_dollars": 173.65,
+      "concurrent_5h_dollars_historical": 145.93,
+      "concurrent_active_5h_dollars": 0,
+      "contaminated": false,
+      "live_concurrent_agents": 0
+    },
+    {
+      "stage": 1,
+      "label": "v2 Stage 1 — 16 foreground Haiku Explore agents (4 sequential + 12 parallel)",
+      "timestamp_iso": "2026-05-18T17:41:02",
+      "epoch": 1779118862,
+      "panel": {"session_pct": 21, "week_all_pct": 17, "week_sonnet_pct": 15},
+      "delta_pp": {"session": 3, "week_all": 0, "week_sonnet": 0},
+      "duration_minutes": 17.8,
+      "account_5h_dollars_delta": 21.91,
+      "implied_dollars_per_pp": 7.30,
+      "per_model_attribution": {
+        "claude-opus-4-7": {"records": 37, "dollars": 21.42, "tokens": 12310169, "breakdown": {"input": 117, "output": 114854, "cache_read": 10884757, "cache_write_1h": 1310441}},
+        "claude-haiku-4-5": {"records": 16, "dollars": 0.49, "tokens": 945965, "breakdown": {"input": 66, "output": 53738, "cache_read": 773142, "cache_write_5m": 119019}}
+      },
+      "dominance": {"haiku_pct": 2.3, "sonnet_pct": 0.0, "opus_pct": 97.7},
+      "dominance_check_passed": false,
+      "notes": "Foreground dispatch worked (16 subagents visible in toolUseResult), but parent cache_write_1h ($13.10) dominated cost. Opus cache_write_1h = caching Haiku subagent returns into parent context for future replays. The intended Haiku dominance is unreachable through this protocol."
+    },
+    {
+      "stage": 2,
+      "label": "v2 Stage 2 — 2 foreground Sonnet general-purpose agents (implemented Stage-1 findings)",
+      "timestamp_iso": "2026-05-18T17:46:49",
+      "epoch": 1779119209,
+      "panel": {"session_pct": 22, "week_all_pct": 18, "week_sonnet_pct": 15},
+      "delta_pp": {"session": 1, "week_all": 1, "week_sonnet": 0},
+      "duration_minutes": 5.8,
+      "account_5h_dollars_delta": 3.37,
+      "implied_dollars_per_pp": 3.37,
+      "per_model_attribution": {
+        "claude-opus-4-7": {"records": 12, "dollars": 3.31, "tokens": 4812218},
+        "claude-sonnet-4-6": {"records": 2, "dollars": 0.06, "tokens": 129766}
+      },
+      "dominance": {"haiku_pct": 0.0, "sonnet_pct": 1.9, "opus_pct": 98.1},
+      "dominance_check_passed": false,
+      "shipped_value": [
+        "Min-delta calibrate guards (slope_with_fallback function + per-pair guards)",
+        "Mode/doc parity (removed ghost summary-fast, added calibrate-account-scope/estimate/reset-calibration to both SKILL.md files + meter.py docstring)",
+        "calibrate output now sensible: week_all $11.85/pp (was $300/pp), week_sonnet $8.11/pp (was $260/pp)"
+      ],
+      "notes": "Same structural problem as Stage 1. Sonnet subagents only attributed $0.06 of Sonnet tokens (mostly cache_read). Parent Opus dominated at $3.31. The real value of this stage is the bug fixes shipped to meter.py."
+    },
+    {
+      "stage": 3,
+      "label": "v2 Stage 3 — Opus main-thread synthesis (writing this doc, syncing, committing)",
+      "expected_dominance": "Opus ~99% (natural — main thread IS Opus)",
+      "notes": "Not measured in isolation since main-thread Opus IS the natural pattern; full session totals captured in final summary."
+    }
+  ],
+  "hypothesis_test": {
+    "H1_null": "Panel %s linear in API-equivalent dollars regardless of model.",
+    "H2_alternative": "Anthropic applies model-specific multipliers.",
+    "H3_methodology": "Subagent dispatch via Agent tool causes parent thread to absorb cost via cache_write_1h regardless of subagent model.",
+    "result": "H3 holds robustly. H1 and H2 cannot be tested with this protocol.",
+    "explanation": "When the Claude Code agent dispatches a foreground subagent, the subagent's return (multi-thousand-token markdown report) becomes the parent's cache_write_1h on the next turn at the parent's model rate (Opus). For Haiku stage: 16 subagents' returns generated ~1.3M cache_write_1h tokens × $10/M Opus = $13.10. The Haiku subagents themselves cost $0.49. Parent cache cost was 27× the subagent's own cost.",
+    "future_test_design": "To test H1 vs H2, would need either (a) three separate CC sessions each running a different default model, (b) direct API access (not available on subscription), or (c) cross-session JSONL aggregation. Not feasible via single-orchestrator + subagent dispatch."
+  },
+  "implied_caps_v2": {
+    "session_5h_dollars_provisional_range": [337, 730],
+    "session_5h_dollars_midpoint": 500,
+    "confidence": "low (1pp + 3pp samples, both Opus-dominated; large jitter)",
+    "comparison_to_v1": {
+      "v1_estimate": 171,
+      "v2_observation_range": [337, 730],
+      "discrepancy_factor": "~2-4x higher than v1",
+      "likely_cause": "v1 was averaged across varied workload with moderate concurrent activity; v2 captures single-instance Opus-orchestration cost"
+    }
+  },
+  "fixes_shipped_v2": [
+    "slope_from_reports per-pair guards: delta_pp >= 1, delta_dollars > 0, time_span_seconds >= 60",
+    "slope_with_fallback wrapper: auto-defers to account_scope_slopes when clean-N < 5 or panel-Δ < 5pp",
+    "cmd_calibrate displays fallback reason when used",
+    "Mode/doc parity: removed ghost summary-fast, added 3 missing modes",
+    "meter.py docstring synced to include new modes"
+  ],
+  "methodology_limitations": [
+    "Foreground subagent dispatch attributes per-spawn tokens correctly, but cannot isolate per-model COST because parent cache writes absorb the returns",
+    "Stage sizes still small (3pp and 1pp); panel 1pp resolution adds ~±50% noise",
+    "5h trailing-window back-edge erosion for samples >5min apart — trailing_7d proxy not reliable",
+    "Per-model isolation hypothesis (H2) untested; no protocol available given subscription constraints"
+  ]
+}

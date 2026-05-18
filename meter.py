@@ -21,6 +21,9 @@ Modes:
   quota             force-refresh quota panel (writes a report)
   sample            alias for quota (kept for memory-file compatibility)
   calibrate         show derived tokens-per-percent estimates from reports/
+  calibrate-account-scope  consecutive-pair $/pp slopes from short-interval samples
+  estimate          --model <m> --tokens <N> [--bucket ...]  $ + est. session/week % impact
+  reset-calibration archive all reports to reports_archive/<timestamp>/ for a fresh start
   reports           list saved reports (own + crowd)
   contribute        print anonymized JSON for sharing to public repo
   tier [<t>]        show/set subscription tier (pro / max5x / max20x)
@@ -504,12 +507,23 @@ def slope_from_reports(reports: list[dict], pct_key: str, window_key: str,
     by_anon = {}
     for s in samples: by_anon.setdefault(s["anon"], []).append(s)
     slopes = []
+    # Per-pair guards: reject pairs that are too small to be informative.
+    # delta_pp >= 1 (panel %s are integers — sub-1pp moves are quantization noise),
+    # delta_dollars > 0 (already enforced), time_span_seconds >= 60 (same-minute
+    # pairs are usually the same captured panel state).
+    MIN_DELTA_PP = 1.0
+    MIN_DELTA_DOLLARS = 0.0
+    MIN_TIME_SPAN_S = 60
     for grp in by_anon.values():
         grp.sort(key=lambda x: x["epoch"])
         for i in range(1, len(grp)):
             dp = grp[i]["pct"] - grp[i-1]["pct"]
             dd = grp[i]["dollars"] - grp[i-1]["dollars"]
-            if dp > 0 and dd > 0: slopes.append(dd / dp)
+            dt = grp[i]["epoch"] - grp[i-1]["epoch"]
+            if dp < MIN_DELTA_PP: continue
+            if dd <= MIN_DELTA_DOLLARS: continue
+            if dt < MIN_TIME_SPAN_S: continue
+            slopes.append(dd / dp)
     if not slopes:
         slopes = [s["dollars"] / s["pct"] for s in samples if s["pct"] > 0]
     if not slopes: return None
@@ -517,6 +531,74 @@ def slope_from_reports(reports: list[dict], pct_key: str, window_key: str,
     return {"dollars_per_percent": round(m, 4),
             "est_full_capacity_dollars": round(m * 100, 2),
             "samples": len(samples), "slopes_used": len(slopes)}
+
+
+def slope_with_fallback(reports: list[dict], pct_key: str, window_key: str,
+                        tier_filter: str | None = None) -> dict | None:
+    """Clean-data slope with auto-fallback to account_scope_slopes() when the
+    clean set is too small or panel-Δ span is too narrow to be informative.
+
+    Returns the same shape as slope_from_reports plus:
+      - method: "clean" or "account-scope-fallback"
+      - fallback_reason: present only when method=="account-scope-fallback"
+
+    Fallback triggers:
+      - clean_pairs < 5, OR
+      - panel pct span across clean samples < 5pp.
+    """
+    MIN_CLEAN_PAIRS = 5
+    MIN_PCT_SPAN = 5.0
+
+    clean = slope_from_reports(reports, pct_key, window_key, tier_filter)
+
+    # Compute clean-sample panel span for the gate (same filtering as slope_from_reports).
+    pcts = []
+    for r in reports:
+        if tier_filter and r.get("tier") != tier_filter: continue
+        if r.get("contaminated") is True: continue
+        if r.get("contaminated") is None and "concurrent_5h_dollars" not in r: continue
+        p = (r.get("panel") or {}).get(pct_key)
+        if p is None or p <= 0: continue
+        pcts.append(p)
+    pct_span = (max(pcts) - min(pcts)) if pcts else 0.0
+
+    clean_pairs = (clean or {}).get("slopes_used", 0) if (clean and not clean.get("insufficient")) else 0
+
+    reason = None
+    if clean is None or clean.get("insufficient"):
+        reason = "no clean pairs"
+    elif clean_pairs < MIN_CLEAN_PAIRS:
+        reason = f"only {clean_pairs} clean pair(s) (<{MIN_CLEAN_PAIRS})"
+    elif pct_span < MIN_PCT_SPAN:
+        reason = f"panel span {pct_span:.0f}pp (<{MIN_PCT_SPAN:.0f}pp)"
+
+    if reason is None:
+        return {**clean, "method": "clean"}
+
+    # Fallback to account-scope.
+    scope_label = {"trailing_5h": "session_5h",
+                   "trailing_7d": "week_all"}.get(window_key, "week_all")
+    # Map by pct_key (more accurate than by window_key for week_sonnet).
+    scope_label = {"session_pct": "session_5h",
+                   "week_all_pct": "week_all",
+                   "week_sonnet_pct": "week_sonnet"}.get(pct_key, scope_label)
+
+    scope = account_scope_slopes(reports, tier_filter=tier_filter)
+    block = scope.get(scope_label)
+    if not block:
+        # Account-scope also has nothing — return the clean result as-is (possibly None).
+        if clean is None:
+            return None
+        return {**clean, "method": "clean", "fallback_attempted": True,
+                "fallback_reason": reason + " (and account-scope had no pairs)"}
+    return {"dollars_per_percent": block["median"],
+            "est_full_capacity_dollars": block["cap_estimate"],
+            "samples": scope.get("report_count", 0),
+            "slopes_used": block["pairs"],
+            "method": "account-scope-fallback",
+            "fallback_reason": reason,
+            "scope_window": scope_label,
+            "iqr": [block["q1"], block["q3"]]}
 
 
 def account_scope_slopes(reports: list[dict], tier_filter: str | None = None,
@@ -575,9 +657,9 @@ def calibration_estimates(include_crowd: bool = False, tier_filter: str | None =
         "report_count": len(reports),
         "own_count": sum(1 for r in reports if not r.get("_crowd")),
         "crowd_count": sum(1 for r in reports if r.get("_crowd")),
-        "session": slope_from_reports(reports, "session_pct", "trailing_5h", tier_filter),
-        "week_all": slope_from_reports(reports, "week_all_pct", "trailing_7d", tier_filter),
-        "week_sonnet": slope_from_reports(reports, "week_sonnet_pct", "trailing_7d", tier_filter),
+        "session": slope_with_fallback(reports, "session_pct", "trailing_5h", tier_filter),
+        "week_all": slope_with_fallback(reports, "week_all_pct", "trailing_7d", tier_filter),
+        "week_sonnet": slope_with_fallback(reports, "week_sonnet_pct", "trailing_7d", tier_filter),
     }
 
 
@@ -896,7 +978,10 @@ def cmd_calibrate(args):
             if e.get("legacy_skipped"): skipped += f", {e['legacy_skipped']} legacy"
             print(f"  {w:<14}  (0 clean reports — {skipped} skipped)")
         else:
-            print(f"  {w:<14}  {fmt_dollars(e['dollars_per_percent'])}/1%  ·  full ~{fmt_dollars(e['est_full_capacity_dollars'])}  ·  {e['slopes_used']} slopes from {e['samples']} samples")
+            line = f"  {w:<14}  {fmt_dollars(e['dollars_per_percent'])}/1%  ·  full ~{fmt_dollars(e['est_full_capacity_dollars'])}  ·  {e['slopes_used']} slopes from {e['samples']} samples"
+            if e.get("method") == "account-scope-fallback":
+                line += f"  (insufficient clean data; using account-scope: {e.get('fallback_reason','')})"
+            print(line)
 
 
 def cmd_calibrate_account_scope(args):
