@@ -217,8 +217,34 @@ def collect(records):
 
 # ─────────────────────────── cost / weighting ───────────────────────────
 
+MODEL_ALIASES = {
+    "haiku": "claude-haiku-4-5",
+    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-4-7",
+}
+
+
+def normalize_model_name(model: str) -> str:
+    """Map any of Anthropic's model-name shapes to a RATES dict key.
+
+    Handles:
+      - aliases: "haiku" -> "claude-haiku-4-5"
+      - date-suffixed: "claude-haiku-4-5-20251001" -> "claude-haiku-4-5"
+      - unversioned: passed through unchanged
+
+    Returns DEFAULT_RATE_KEY for truly unknown names.
+    """
+    if not model: return DEFAULT_RATE_KEY
+    if model in RATES: return model
+    if model in MODEL_ALIASES: return MODEL_ALIASES[model]
+    # Strip trailing -YYYYMMDD (8-digit date) suffix
+    m = re.sub(r"-\d{8}$", "", model)
+    if m in RATES: return m
+    return DEFAULT_RATE_KEY
+
+
 def rates_for(model: str) -> dict:
-    return RATES.get(model, RATES[DEFAULT_RATE_KEY])
+    return RATES[normalize_model_name(model)]
 
 
 def cost_of(b: dict, model: str) -> float:
