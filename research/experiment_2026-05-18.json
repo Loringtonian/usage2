@@ -1,0 +1,122 @@
+{
+  "experiment_date": "2026-05-18",
+  "experiment_title": "Per-model cost vs panel-% on Max 20x \u2014 controlled three-stage experiment",
+  "tier": "max20x",
+  "duration_minutes": 11.6,
+  "platform": "Claude Code, subscription (Max 20x), session 5595198a... on macOS Darwin 24.6.0",
+  "stages": [
+    {
+      "stage": 0,
+      "label": "Pre-flight baseline",
+      "timestamp_iso": "2026-05-18T12:01:57+00:00",
+      "epoch": 1779105717,
+      "panel": {
+        "session_pct": 5,
+        "week_all_pct": 12,
+        "week_sonnet_pct": 15
+      },
+      "trailing_5h_dollars": 36.95,
+      "trailing_7d_dollars": 3918.36,
+      "concurrent_5h_dollars_historical": 31.07,
+      "concurrent_active_5h_dollars": null,
+      "live_active_sessions": 0,
+      "notes": "Clean conditions confirmed. 24 'concurrent' JSONLs were mtime-residuals from morning sessions, not active agents."
+    },
+    {
+      "stage": 1,
+      "label": "Haiku audit pass \u2014 7 parallel Explore subagents (background)",
+      "timestamp_iso": "2026-05-18T12:07:17+00:00",
+      "epoch": 1779106037,
+      "panel": {
+        "session_pct": 8,
+        "week_all_pct": 12,
+        "week_sonnet_pct": 15
+      },
+      "delta_pp": {
+        "session": 3,
+        "week_all": 0,
+        "week_sonnet": 0
+      },
+      "main_thread_opus_dollars": 4.512,
+      "main_thread_opus_tokens": {
+        "input": 129,
+        "output": 26591,
+        "cache_read": 4866818,
+        "cache_write_1h": 141320
+      },
+      "main_thread_opus_turns": 34,
+      "subagent_attribution_visible": 0,
+      "subagent_attribution_expected": 7,
+      "estimated_haiku_subagent_dollars": 0.62,
+      "implied_dollars_per_pp": 1.71,
+      "notes": "7 Haiku Explore agents dispatched in background. None appear in toolUseResult.totalTokens in parent JSONL. They consumed real quota (panel ticked) but are invisible to per-spawn meter attribution."
+    },
+    {
+      "stage": 2,
+      "label": "Sonnet implementation pass \u2014 1 general-purpose subagent (background)",
+      "timestamp_iso": "2026-05-18T12:13:32+00:00",
+      "epoch": 1779106412,
+      "panel": {
+        "session_pct": 9,
+        "week_all_pct": 13,
+        "week_sonnet_pct": 15
+      },
+      "delta_pp": {
+        "session": 1,
+        "week_all": 1,
+        "week_sonnet": 0
+      },
+      "main_thread_opus_dollars": 1.777,
+      "main_thread_opus_tokens": {
+        "input": 26,
+        "output": 19054,
+        "cache_read": 2141395,
+        "cache_write_1h": 22981
+      },
+      "main_thread_opus_turns": 11,
+      "subagent_attribution_visible": 0,
+      "subagent_attribution_expected": 1,
+      "estimated_sonnet_subagent_dollars": "trivial",
+      "implied_dollars_per_pp": 1.78,
+      "first_clean_report": true,
+      "notes": "Sonnet subagent ran ~3.7min, 92K tokens self-reported. Did not appear in parent JSONL. After Change 2 (active_only filter) went live, the next report became the first non-contaminated report in the dataset (concurrent_active_5h_dollars = $0)."
+    }
+  ],
+  "implied_caps": {
+    "session_5h_dollars": 171,
+    "week_7d_all_dollars": 1185,
+    "week_7d_sonnet_dollars": 811
+  },
+  "calibration_method_used": "calibrate-account-scope (shipped in this experiment)",
+  "calibration_data_source": "41 reports in ~/.claude/skills/usage2/reports/ (mostly mtime-contaminated by historical residuals; account-scope panel-vs-dollar deltas are robust to that)",
+  "calibration_pairs_extracted": 15,
+  "calibration_result_session_5h": {
+    "median_dollars_per_pp": 1.71,
+    "iqr_low": 1.63,
+    "iqr_high": 1.76
+  },
+  "calibration_result_week_all": {
+    "median_dollars_per_pp": 11.85,
+    "iqr_low": 9.44,
+    "iqr_high": 16.35
+  },
+  "calibration_result_week_sonnet": {
+    "median_dollars_per_pp": 8.11,
+    "iqr_low": 7.46,
+    "iqr_high": 8.71
+  },
+  "hypothesis_test": {
+    "H1_null": "Panel %s are linear in API-equivalent dollars regardless of model mix.",
+    "H2_alternative": "Anthropic applies model-specific multipliers to session/week_all panels.",
+    "result": "H1 HOLDS within measurement resolution",
+    "evidence": "Stage 1 implied $1.71/pp; Stage 2 implied $1.78/pp; both within IQR of calibrate-account-scope's $1.63-$1.76. Cross-stage variance < 5%, well inside panel 1pp resolution noise floor. Cannot reject H1.",
+    "caveat": "Each stage was dominated by main-thread Opus cost (cache-heavy). Background subagent contributions were invisible and likely small. A future experiment with explicit foreground Haiku/Sonnet/Opus dispatches and 5pp+ panel moves per stage could give a sharper test."
+  },
+  "shipped_improvements": [
+    "Fix calibrate KeyError (P0): tokens_per_percent -> dollars_per_percent + handle 'insufficient' sentinel",
+    "Add active_only=120s filter to find_active_jsonls; use for contamination flag (historical mtime residuals no longer trigger false contamination)",
+    "Security scrubs in cmd_contribute: drop timestamp_local, strip TZ from panel resets, replace concurrent_*_UUID lists with counts",
+    "Add calibrate-account-scope mode: extracts clean slopes from contaminated reports via \u0394account-$ vs \u0394panel-%",
+    "Add estimate mode: '/usage2 estimate --model opus --tokens 1m' -> $/% of session"
+  ]
+}

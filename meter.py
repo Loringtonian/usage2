@@ -87,29 +87,48 @@ SKIP_MODELS = {"<synthetic>", "synthetic", None, "", "unknown"}
 # ─────────────────────────── transcript parsing ───────────────────────────
 
 def project_slug(path: Path) -> str:
-    return re.sub(r"[/_]", "-", str(path.resolve()).rstrip("/"))
+    # Mirror Claude Code's slug rule: `/`, `_`, AND `.` all become `-`.
+    # Missing `.` here is why `/Users/.../.claude/worktrees/...` paths failed to resolve.
+    return re.sub(r"[/_.]", "-", str(path.resolve()).rstrip("/"))
 
 
 def current_session_jsonl(cwd: Path | None = None) -> Path | None:
     """Find the JSONL for the calling Claude Code session.
 
-    Preference order:
-      1. $CLAUDE_CODE_SESSION_ID — set by Claude Code in its own env; authoritative.
-         Critical when multiple CC instances run in the same project (each writes
-         its own JSONL; "most recently modified" would mis-attribute work).
-      2. Most-recently-modified *.jsonl in the project dir (fallback for older CC
-         or non-CC invocations).
+    Resolution order:
+      1. $CLAUDE_CODE_SESSION_ID + ancestor-slug walk. CC stores the JSONL under
+         the slug of wherever `claude` was launched, NOT necessarily the current
+         shell cwd (matters when working inside a git worktree subdir but CC was
+         launched from the main repo root). Walk cwd up the tree and pick the
+         first ancestor whose slug-dir contains `<sid>.jsonl`.
+      2. Most-recently-modified `*.jsonl` in any existing ancestor slug-dir.
+         Coarse fallback for older CC or non-CC invocations.
     """
-    cwd = cwd or Path.cwd()
-    p = PROJECTS_DIR / project_slug(cwd)
-    if not p.exists(): return None
+    cwd = (cwd or Path.cwd()).resolve()
+    # Build candidate ancestor list (cwd → root)
+    candidates: list[Path] = []
+    p = cwd
+    while True:
+        candidates.append(p)
+        if p == p.parent:
+            break
+        p = p.parent
+
     sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
     if sid:
-        candidate = p / f"{sid}.jsonl"
-        if candidate.exists():
-            return candidate
-    files = list(p.glob("*.jsonl"))
-    return max(files, key=lambda f: f.stat().st_mtime) if files else None
+        for cand in candidates:
+            jsonl = PROJECTS_DIR / project_slug(cand) / f"{sid}.jsonl"
+            if jsonl.exists():
+                return jsonl
+
+    for cand in candidates:
+        slug_dir = PROJECTS_DIR / project_slug(cand)
+        if not slug_dir.exists():
+            continue
+        files = list(slug_dir.glob("*.jsonl"))
+        if files:
+            return max(files, key=lambda f: f.stat().st_mtime)
+    return None
 
 
 def parse_records(path: Path, byte_offset: int = 0):
@@ -230,15 +249,20 @@ def weighted_input_equiv(b: dict, model: str) -> float:
 
 # ─────────────────────────── window aggregation ───────────────────────────
 
-def find_active_jsonls(window_seconds: float, exclude: Path | None = None) -> list[Path]:
+def find_active_jsonls(window_seconds: float, exclude: Path | None = None,
+                        active_only: bool = False) -> list[Path]:
     """Return all *.jsonl across ~/.claude/projects/*/ modified within the window.
 
     Used for account-scope token aggregation when the user runs multiple
     concurrent Claude Code sessions. Each session has its own JSONL, but the
     /usage panel reflects the whole account — so the calibration needs to see
     ALL of them to correctly attribute tokens-per-percent.
+
+    When `active_only=True`, the cutoff is forced to 120 seconds — i.e. only
+    sessions actively writing right now count. Used for contamination
+    detection so historical mtime residuals don't flag a quiet sample.
     """
-    cutoff = time.time() - window_seconds
+    cutoff = time.time() - (120 if active_only else window_seconds)
     out = []
     if not PROJECTS_DIR.exists(): return out
     for proj in PROJECTS_DIR.iterdir():
@@ -395,6 +419,8 @@ def refresh_quota(force: bool = False, write_report: bool = True, jsonl: Path | 
             # Account-scope: all local JSONLs modified in the window
             others_5h = find_active_jsonls(5 * 3600, exclude=jsonl)
             others_7d = find_active_jsonls(7 * 86400, exclude=jsonl)
+            # Currently-active (last 120s) only — for contamination flag
+            others_active_5h = find_active_jsonls(5 * 3600, exclude=jsonl, active_only=True)
             session_5h = tokens_in_window(jsonl, 5 * 3600)
             session_7d = tokens_in_window(jsonl, 7 * 86400)
             account_5h = tokens_in_window([jsonl] + others_5h, 5 * 3600)
@@ -402,7 +428,10 @@ def refresh_quota(force: bool = False, write_report: bool = True, jsonl: Path | 
             # Concurrent contamination: sum of dollar consumption from OTHER sessions
             concurrent_5h_dollars = round(sum(tokens_in_window(o, 5 * 3600)["dollars"] for o in others_5h), 4)
             concurrent_7d_dollars = round(sum(tokens_in_window(o, 7 * 86400)["dollars"] for o in others_7d), 4)
-            contaminated = concurrent_5h_dollars > CONTAMINATION_THRESHOLD_USD
+            concurrent_active_5h_dollars = round(sum(tokens_in_window(o, 5 * 3600)["dollars"] for o in others_active_5h), 4)
+            # Contamination is determined by ACTIVE concurrent sessions only —
+            # historical residuals in the 5h window shouldn't poison the report.
+            contaminated = concurrent_active_5h_dollars > CONTAMINATION_THRESHOLD_USD
             # Top-level dollars/weighted = account scope (for calibration use)
             save_report({
                 "schema_version": SCHEMA_VERSION,
@@ -422,6 +451,7 @@ def refresh_quota(force: bool = False, write_report: bool = True, jsonl: Path | 
                 "concurrent_7d": [p.stem for p in others_7d],
                 "concurrent_5h_dollars": concurrent_5h_dollars,
                 "concurrent_7d_dollars": concurrent_7d_dollars,
+                "concurrent_active_5h_dollars": concurrent_active_5h_dollars,
                 "contaminated": contaminated,
                 "contamination_threshold_usd": CONTAMINATION_THRESHOLD_USD,
             })
@@ -487,6 +517,56 @@ def slope_from_reports(reports: list[dict], pct_key: str, window_key: str,
     return {"dollars_per_percent": round(m, 4),
             "est_full_capacity_dollars": round(m * 100, 2),
             "samples": len(samples), "slopes_used": len(slopes)}
+
+
+def account_scope_slopes(reports: list[dict], tier_filter: str | None = None,
+                          pair_window_seconds: int = 600) -> dict:
+    """Extract $/pp slopes from consecutive-pair deltas across reports.
+
+    Works on contaminated reports — account-scope dollars include ALL
+    concurrent sessions, and the panel % reflects the same account-wide tally,
+    so consecutive samples taken close together (default <10 min) give a
+    clean delta regardless of who else is running.
+
+    Returns one slopes block per window: session_5h, week_all, week_sonnet.
+    """
+    rs = [r for r in reports if (tier_filter is None or r.get("tier") == tier_filter)]
+    rs = [r for r in rs if r.get("epoch")]
+    rs.sort(key=lambda r: r.get("epoch", 0))
+
+    def _stats(slopes: list[float]) -> dict | None:
+        if not slopes: return None
+        s = sorted(slopes)
+        n = len(s)
+        med = s[n // 2]
+        q1 = s[n // 4]
+        q3 = s[(3 * n) // 4]
+        return {"median": round(med, 4), "q1": round(q1, 4), "q3": round(q3, 4),
+                "pairs": n, "cap_estimate": round(med * 100, 2)}
+
+    windows = (("session_5h",   "session_pct",     "trailing_7d"),
+               ("week_all",     "week_all_pct",    "trailing_7d"),
+               ("week_sonnet",  "week_sonnet_pct", "trailing_7d"))
+    out = {"report_count": len(rs), "tier_filter": tier_filter,
+           "pair_window_seconds": pair_window_seconds}
+    for label, pct_key, win_key in windows:
+        slopes = []
+        for i in range(1, len(rs)):
+            a, b = rs[i - 1], rs[i]
+            if (b.get("epoch", 0) - a.get("epoch", 0)) >= pair_window_seconds: continue
+            pa = (a.get("panel") or {}).get(pct_key)
+            pb = (b.get("panel") or {}).get(pct_key)
+            if pa is None or pb is None: continue
+            if pb <= pa: continue  # reset or no growth
+            da = (a.get(win_key) or {}).get("dollars")
+            db = (b.get(win_key) or {}).get("dollars")
+            if da is None or db is None: continue
+            dd = db - da
+            dp = pb - pa
+            if dd > 0 and dp > 0:
+                slopes.append(dd / dp)
+        out[label] = _stats(slopes)
+    return out
 
 
 def calibration_estimates(include_crowd: bool = False, tier_filter: str | None = None) -> dict:
@@ -811,8 +891,105 @@ def cmd_calibrate(args):
         e = est.get(w)
         if e is None:
             print(f"  {w:<14}  (need ≥2 reports with delta)")
+        elif e.get("insufficient"):
+            skipped = f"{e.get('contaminated_skipped', 0)} contaminated"
+            if e.get("legacy_skipped"): skipped += f", {e['legacy_skipped']} legacy"
+            print(f"  {w:<14}  (0 clean reports — {skipped} skipped)")
         else:
-            print(f"  {w:<14}  {fmt(e['tokens_per_percent']):>10}/1%  ·  full ~{fmt(e['est_full_capacity'])}  ·  {e['slopes_used']} slopes from {e['samples']} samples")
+            print(f"  {w:<14}  {fmt_dollars(e['dollars_per_percent'])}/1%  ·  full ~{fmt_dollars(e['est_full_capacity_dollars'])}  ·  {e['slopes_used']} slopes from {e['samples']} samples")
+
+
+def cmd_calibrate_account_scope(args):
+    """Account-scope calibration: consecutive-pair $/pp slopes from short-interval samples."""
+    include_crowd = "--crowd" in args
+    cfg = load_config()
+    tier = cfg.get("tier")
+    reports = load_reports(include_crowd=include_crowd)
+    res = account_scope_slopes(reports, tier_filter=tier)
+    print(f"## Account-scope calibration  ({res['report_count']} reports, tier={tier or 'any'})")
+    print(f"## Method: consecutive-pair deltas within {res['pair_window_seconds']}s windows")
+    print()
+    labels = (("session_5h",  "Session 5h:  "),
+              ("week_all",    "Week (all):  "),
+              ("week_sonnet", "Week (Son.): "))
+    for key, lbl in labels:
+        s = res.get(key)
+        if s is None:
+            print(f"  {lbl} (no clean pairs)"); continue
+        print(f"  {lbl}median {fmt_dollars(s['median'])}/pp  IQR {fmt_dollars(s['q1'])}–{fmt_dollars(s['q3'])}  "
+              f"({s['pairs']} pairs)  →  cap ≈ {fmt_dollars(s['cap_estimate'])}")
+
+
+def cmd_estimate(args):
+    """Convert a token budget into $ + estimated session/week % impact."""
+    # Manual argv parsing — keeps this consistent with the rest of the file.
+    def _flag(name, default=None):
+        if name in args:
+            i = args.index(name)
+            if i + 1 < len(args): return args[i + 1]
+        return default
+    raw_model = _flag("--model")
+    raw_tokens = _flag("--tokens")
+    bucket = _flag("--bucket", "blended")
+    if not raw_model or not raw_tokens:
+        print("Usage: usage2 estimate --model <model> --tokens <N|Xk|Xm> [--bucket input|output|cache_read|cache_write_5m|cache_write_1h|blended]", file=sys.stderr)
+        sys.exit(1)
+
+    short = {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5"}
+    model = short.get(raw_model.lower(), raw_model)
+    if model not in RATES:
+        print(f"ERR: unknown model '{model}'. Known: {list(RATES.keys())}", file=sys.stderr); sys.exit(1)
+
+    t = raw_tokens.lower().strip()
+    try:
+        if t.endswith("m"):   tokens = int(float(t[:-1]) * 1_000_000)
+        elif t.endswith("k"): tokens = int(float(t[:-1]) * 1_000)
+        else:                 tokens = int(t)
+    except ValueError:
+        print(f"ERR: invalid --tokens '{raw_tokens}'", file=sys.stderr); sys.exit(1)
+
+    rates = RATES[model]
+    # Heuristic blended mix for a typical Claude Code turn — rough; override
+    # via --bucket <specific> when you know the shape of your tokens.
+    blended_mix = {"cache_read": 0.60, "cache_write_1h": 0.25, "input": 0.10, "output": 0.05}
+    if bucket == "blended":
+        rate_per_m = sum(rates[k] * w for k, w in blended_mix.items())
+    else:
+        if bucket not in rates:
+            print(f"ERR: unknown --bucket '{bucket}'. Known: {list(rates.keys())} or 'blended'", file=sys.stderr); sys.exit(1)
+        rate_per_m = rates[bucket]
+    dollars = tokens * rate_per_m / 1_000_000
+
+    # Calibration: prefer account-scope slopes (works on contaminated data).
+    cfg = load_config()
+    tier = cfg.get("tier")
+    reports = load_reports(include_crowd=False)
+    slopes = account_scope_slopes(reports, tier_filter=tier)
+    fallback_defaults = {"max20x": 1.73, "max5x": 0.85, "pro": 0.40}
+    sess = slopes.get("session_5h")
+    week = slopes.get("week_all")
+    son = slopes.get("week_sonnet")
+    sess_per_pp = sess["median"] if sess else None
+    week_per_pp = week["median"] if week else None
+    son_per_pp = son["median"] if son else None
+    used_default = False
+    if sess_per_pp is None:
+        sess_per_pp = fallback_defaults.get(tier, fallback_defaults["max20x"])
+        used_default = True
+
+    sess_pp = dollars / sess_per_pp if sess_per_pp else 0
+    week_pp = dollars / week_per_pp if week_per_pp else None
+    son_pp  = dollars / son_per_pp  if son_per_pp  else None
+
+    print(f"Cost estimate for {fmt(tokens)} tokens of {model} ({bucket}):")
+    print(f"  API-equivalent: {fmt_dollars(dollars)}")
+    print(f"  Session 5h:     ~{sess_pp:.1f}%" + ("  (no calibration data; using default)" if used_default else ""))
+    if week_pp is not None:
+        print(f"  Week (all):     ~{week_pp:.1f}%")
+    if son_pp is not None and model.startswith("claude-sonnet"):
+        print(f"  Week (Sonnet):  ~{son_pp:.1f}%")
+    if bucket == "blended":
+        print("  (blended mix: 60% cache_read · 25% cache_write_1h · 10% input · 5% output — rough)")
 
 
 def cmd_reset_calibration():
@@ -853,12 +1030,33 @@ def cmd_contribute(jsonl: Path):
         reports = load_reports(include_crowd=False)
         if not reports:
             print("ERR: no reports to contribute. Run `usage2 quota` first.", file=sys.stderr); sys.exit(1)
-    # Bundle: all of this user's reports, stripped of any identifying info beyond anon UUID + tier
+    # Scrub each report: drop local timestamp, strip TZ from reset strings,
+    # replace per-UUID concurrent lists with counts. Source reports on disk
+    # are NOT mutated — we build a fresh list.
+    scrubbed_reports = []
+    tz_re = re.compile(r"\s*\([^)]+\)\s*$")
+    for r in reports:
+        s = {k: v for k, v in r.items() if k not in ("panel_text", "timestamp_local")}
+        panel = s.get("panel")
+        if isinstance(panel, dict):
+            scrub_panel = dict(panel)
+            for k in ("session_reset", "week_reset", "week_sonnet_reset"):
+                v = scrub_panel.get(k)
+                if isinstance(v, str):
+                    scrub_panel[k] = tz_re.sub("", v).strip()
+            s["panel"] = scrub_panel
+        c5 = s.pop("concurrent_5h", None)
+        c7 = s.pop("concurrent_7d", None)
+        if isinstance(c5, list):
+            s["concurrent_5h_session_count"] = len(c5)
+        if isinstance(c7, list):
+            s["concurrent_7d_session_count"] = len(c7)
+        scrubbed_reports.append(s)
     bundle = {
         "schema_version": SCHEMA_VERSION,
         "contributed_at": datetime.now(timezone.utc).isoformat(),
-        "report_count": len(reports),
-        "reports": [{k: v for k, v in r.items() if k != "panel_text"} for r in reports],
+        "report_count": len(scrubbed_reports),
+        "reports": scrubbed_reports,
     }
     print("## Anonymized contribution bundle")
     print("## To contribute: save this JSON as `crowd_reports/<your-anon-id>.json`")
@@ -882,6 +1080,10 @@ def main():
         cmd_tier(rest); return
     if mode == "calibrate":
         cmd_calibrate(args); return
+    if mode == "calibrate-account-scope":
+        cmd_calibrate_account_scope(args); return
+    if mode == "estimate":
+        cmd_estimate(args); return
     if mode == "reports":
         cmd_reports(); return
     if mode == "reset-calibration":

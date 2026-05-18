@@ -86,20 +86,30 @@ No npm, no Python deps, no API keys.
 | Mode                      | Purpose                                                            | Cost   |
 |---------------------------|--------------------------------------------------------------------|--------|
 | `summary` (default)       | Tokens + $ + % session + % week + calibration + signals            | ~12s\* |
-| `summary-fast`            | Same but skip quota refresh (use cached %)                         | ~10ms  |
 | `quick`                   | One-line: tokens · $ · cache% · session% · week%                   | ~10ms  |
-| `agents`                  | Per-subagent attribution                                           | ~10ms  |
+| `agents`                  | Per-subagent attribution (foreground subagents only — see caveats) | ~10ms  |
 | `mark <name>` `[--quota]` | Save a checkpoint, optionally with a quota snapshot                | ~10ms / ~12s |
 | `since <name>`            | Tokens + $ + quota Δ since checkpoint                              | ~10ms  |
 | `marks`                   | List saved checkpoints                                             | ~1ms   |
 | `drop <name>`             | Delete a checkpoint                                                | ~1ms   |
 | `raw`                     | JSON dump of everything (for downstream tools)                     | ~10ms  |
 | `quota`                   | Force-refresh quota panel + show parsed result                     | ~12s   |
-| `sample`                  | Record a calibration sample                                        | ~12s   |
-| `calibrate`               | Show calibration history + derived tokens-per-percent              | ~1ms   |
+| `sample`                  | Alias for `quota` (force capture + write a calibration report)     | ~12s   |
+| `calibrate`               | Show derived $/pp from clean (non-contaminated) reports            | ~1ms   |
+| `calibrate-account-scope` | $/pp from chronological pair-deltas (works on contaminated data)   | ~1ms   |
+| `estimate --model X --tokens N [--bucket B]` | Cost & % session/week for a planned action      | ~1ms   |
+| `reports`                 | List saved reports (own + crowd)                                   | ~1ms   |
+| `contribute`              | Print anonymized JSON for sharing to public repo                   | ~1ms   |
+| `reset-calibration`       | Archive `reports/` to start fresh (e.g., after limit changes)      | ~1ms   |
 | `tier [<t>]`              | Show or set subscription tier (pro / max5x / max20x)               | ~1ms   |
 
 \* `summary` calls within 10 min of a previous quota capture reuse the cached % and run in ~10ms.
+
+### Flags
+
+- `--no-quota` — In `summary` / `since`, skip the quota refresh and use the 10-min cache.
+- `--crowd` — In `summary` / `calibrate` / `since`, also merge crowd-contributed reports.
+- `--quota` — In `mark <name>`, capture a quota snapshot at mark time so `since` can report panel-% delta later.
 
 ## The A/B workflow
 
@@ -120,13 +130,30 @@ Each `since` reports the tokens consumed, the API-equivalent dollar delta, and (
 Anthropic doesn't publish per-tier token caps. So `usage2` learns yours:
 
 ```bash
-python3 meter.py sample              # take a sample now
+python3 meter.py sample                       # take a sample now
 # ... ~15+ min and some real usage later ...
-python3 meter.py sample              # take another
-python3 meter.py calibrate           # show derived estimates
+python3 meter.py sample                       # take another
+python3 meter.py calibrate                    # uses only clean (non-contaminated) reports
+python3 meter.py calibrate-account-scope      # uses chronological pair-deltas — works on contaminated data too
+python3 meter.py estimate --model opus --tokens 1m   # plan a specific action
 ```
 
-Each sample stores `(quota %, trailing-5h tokens, trailing-7d tokens)`. With ≥2 samples the meter derives tokens-per-percent via consecutive-pair slopes (median-of-slopes for robustness). Estimates feed into `summary`'s capacity readouts.
+Each sample stores `(quota %, trailing-5h dollars, trailing-7d dollars)`. With ≥2 samples either calibrate mode derives $/pp via consecutive-pair slopes (median-of-slopes for robustness).
+
+**Two modes, two use-cases:**
+
+- **`calibrate`** uses *only* reports where the account was single-instance during sampling. Cleanest signal, but you may have zero usable reports if you typically run multiple Claude Code sessions.
+- **`calibrate-account-scope`** uses **all** chronologically-adjacent report pairs, including contaminated ones. Premise: panel %s reflect account-wide consumption, so account-scope dollars vs. account-scope panel-Δ is valid regardless of how many concurrent sessions ran. Strongly recommended if you run multiple sessions.
+
+**Empirical caps** (Max 20x on 2026-05-18) from a controlled 3-stage experiment:
+
+| Window | $/pp | Cap | 
+|---|---|---|
+| Session 5h | $1.71 | ~$171 |
+| Week (all) 7d | $11.85 | ~$1,185 |
+| Week (Sonnet) 7d | $8.11 | ~$811 |
+
+Full methodology: [`research/per_model_cost.md`](research/per_model_cost.md). Recalibrate when Anthropic adjusts caps.
 
 ## Autonomous self-throttling pattern
 
@@ -175,9 +202,9 @@ In any Claude Code session, type `/usage2` (or just ask: "how many tokens has th
 
 ## Caveats
 
-- **Concurrent Claude Code sessions distort calibration.** When you run multiple CC instances on the same account in parallel, the /usage panel reflects all of them but each session's transcript only sees its own tokens. The meter now detects concurrent sessions (other JSONLs with ≥$1 of activity in the rolling window) and aggregates their tokens for calibration's account-scope view. It also surfaces them in `summary` output with a ⚠ block. **For cleanest calibration, pause concurrent agents during sampling runs** — or take many samples across varied concurrency patterns and let the noise average out. Cross-device usage (claude.ai web, other machines) is still invisible to the local meter; the panel sees it, the meter can't.
+- **Concurrent Claude Code sessions distort *single-session* calibration but not account-scope.** When you run multiple CC instances on the same account in parallel, the panel %s reflect the *whole account*. `calibrate` filters to clean (non-contaminated) reports only. `calibrate-account-scope` works on the full report set because account-wide dollars + account-wide panel-Δ remain coherent. The contamination flag now uses "modified in last 120 seconds" (active right now), not "modified anywhere in the rolling window" (which incorrectly flagged historical residuals from this morning as contamination). Cross-device usage (claude.ai web, other machines) is still invisible to the local meter; the panel sees it, the meter can't.
 - **The in-flight turn isn't in the JSONL yet.** The meter is always one turn behind the live state. Fine for between-turn polling.
-- **Subagents are aggregated.** You see the full cost of each spawn, not its internal turn-by-turn breakdown.
+- **Subagent attribution is foreground-only.** The `agents` mode shows per-spawn cost only for *foreground* (non-background) Agent dispatches — `toolUseResult.totalTokens` is the data source and background agents don't populate it in the parent JSONL. Background subagents still consume real quota (the panel ticks); they just don't show up in `agents`. Use foreground dispatch when you need per-spawn attribution.
 - **Hooks aren't separately attributed.** Context they inject shows up in the next assistant turn's input count.
 - **The "days of subscription fee" line is informational** — it represents API-equivalent value extracted, not what you actually pay.
 - **Calibration needs ≥2 samples** spread across enough usage to see real movement. Anthropic's quota windows reset on a rolling basis; samples too close together may give noisy slopes.
