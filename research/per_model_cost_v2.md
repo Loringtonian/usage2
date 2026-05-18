@@ -1,5 +1,7 @@
 # Per-model cost vs. panel-% — v2 (Max 20x, 2026-05-18)
 
+> **⚠ SUPERSEDED 2026-05-18 by v3.** See **[per_model_cost_v3.md](per_model_cost_v3.md)** for the corrected findings. v2's "per-model isolation impossible" finding was correct *for the Agent-tool protocol*, but v3 used `claude -p` subprocesses instead and successfully isolated per-model effects. v2's provisional caps ($337–$730) overestimated; v3's direct measurement gives ~$72.
+
 **Supersedes:** [`per_model_cost.md`](per_model_cost.md). The v1 numbers ($1.71/pp session, $171 cap) were derived from a flawed methodology that this experiment exposed.
 
 **TL;DR:** A controlled re-run with foreground subagent dispatch found that **per-model isolation via the Agent tool is structurally impossible** for /usage2 attribution, because subagent returns become parent-thread `cache_write_1h` at Opus rates. Even with foreground dispatch (which makes `toolUseResult.totalTokens` visible to the meter), the parent's cache writes from agent returns dominate the actual quota cost. Both Stage 1 (Haiku-targeted) and Stage 2 (Sonnet-targeted) were 97-98% Opus-dominated. The per-model multiplier hypothesis (H2) **cannot be tested by any subagent-based protocol**. New empirical caps below.

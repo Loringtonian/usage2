@@ -1,6 +1,6 @@
 # Per-model cost vs. panel-% (Max 20x, 2026-05-18)
 
-> **⚠ SUPERSEDED 2026-05-18:** A v2 re-run exposed methodology flaws in this document. The $1.71/pp / $171 cap numbers below were derived from a workload that didn't actually isolate per-model effects, and the empirical caps may be too low. See **[per_model_cost_v2.md](per_model_cost_v2.md)** for the corrected findings. The methodology limitations section below is mostly still valid; the headline numbers are not.
+> **⚠ SUPERSEDED 2026-05-18 (twice):** v2 exposed methodology flaws here, then v3 superseded v2. **See [per_model_cost_v3.md](per_model_cost_v3.md)** for the current findings. v1's $1.71/pp / $171 cap was derived from a flawed JSONL-scan calculation (cache-write double-count + date-suffix model fallback to Sonnet pricing). The actual Max 20x session 5h cap measured directly via `claude -p` subprocesses is **~$72**, not $171.
 
 A controlled three-stage experiment on a single Max 20x account to test whether Anthropic's `/usage` panel weights different models the same way the public API rates suggest.
 

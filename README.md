@@ -145,13 +145,15 @@ Each sample stores `(quota %, trailing-5h dollars, trailing-7d dollars)`. With �
 - **`calibrate`** uses *only* reports where the account was single-instance during sampling. Cleanest signal, but you may have zero usable reports if you typically run multiple Claude Code sessions.
 - **`calibrate-account-scope`** uses **all** chronologically-adjacent report pairs, including contaminated ones. Premise: panel %s reflect account-wide consumption, so account-scope dollars vs. account-scope panel-Δ is valid regardless of how many concurrent sessions ran. Strongly recommended if you run multiple sessions.
 
-**Empirical caps** (Max 20x on 2026-05-18) from a controlled 3-stage experiment. ⚠ The v1 numbers below have been superseded by [`research/per_model_cost_v2.md`](research/per_model_cost_v2.md) — v2 found that subagent-based per-model isolation is structurally impossible, and the real caps are likely **2-4× higher** than these (provisional range $337-$730 session, midpoint ~$500). Use v2 numbers when planning.
+**Empirical caps** (Max 20x on 2026-05-18) measured directly via `claude -p` subprocesses across three single-model stages. Full methodology: [`research/per_model_cost_v3.md`](research/per_model_cost_v3.md). v1 and v2 docs are SUPERSEDED.
 
-v1 numbers (under-estimate):
+| Window | Haiku $/pp | Sonnet $/pp | Opus $/pp | Cap (3-model avg) |
+|---|---|---|---|---|
+| Session 5h | $0.675 | $0.656 | $0.823 | **~$72** |
 
-| Window | $/pp | Cap | 
-|---|---|---|
-| Session 5h | $1.71 | ~$171 |
+Cross-model spread 22.6%. Haiku/Sonnet match within 3% — H1 (panel linear in API-$) supported. Opus runs 22% above the Haiku/Sonnet baseline — mild evidence of a small Opus penalty, or panel-resolution noise.
+
+**Caveat — Agent tool tax:** subagent dispatches (foreground OR background via the Agent tool) inflate parent-side `cache_write_1h` at the parent's model rate. The subagent's own tokens are a minority of the total cost. For per-model comparisons, use `claude -p --model X` subprocesses instead. See v3 doc for details.
 | Week (all) 7d | $11.85 | ~$1,185 |
 | Week (Sonnet) 7d | $8.11 | ~$811 |
 
@@ -206,7 +208,7 @@ In any Claude Code session, type `/usage2` (or just ask: "how many tokens has th
 
 - **Concurrent Claude Code sessions distort *single-session* calibration but not account-scope.** When you run multiple CC instances on the same account in parallel, the panel %s reflect the *whole account*. `calibrate` filters to clean (non-contaminated) reports only. `calibrate-account-scope` works on the full report set because account-wide dollars + account-wide panel-Δ remain coherent. The contamination flag now uses "modified in last 120 seconds" (active right now), not "modified anywhere in the rolling window" (which incorrectly flagged historical residuals from this morning as contamination). Cross-device usage (claude.ai web, other machines) is still invisible to the local meter; the panel sees it, the meter can't.
 - **The in-flight turn isn't in the JSONL yet.** The meter is always one turn behind the live state. Fine for between-turn polling.
-- **Subagent attribution is foreground-only.** The `agents` mode shows per-spawn cost only for *foreground* (non-background) Agent dispatches — `toolUseResult.totalTokens` is the data source and background agents don't populate it in the parent JSONL. Background subagents still consume real quota (the panel ticks); they just don't show up in `agents`. Use foreground dispatch when you need per-spawn attribution.
+- **Subagent attribution is foreground-only AND understates per-spawn cost.** The `agents` mode shows per-spawn cost only for *foreground* (non-background) Agent dispatches — `toolUseResult.totalTokens` is the data source and background agents don't populate it in the parent JSONL. Background subagents still consume real quota (the panel ticks); they just don't show up in `agents`. **More importantly:** the displayed per-spawn cost is only the subagent's own tokens. The subagent's *return* becomes the parent's next-turn `cache_write_1h` at the parent's model rate (always Opus in interactive Claude Code), typically 10–30× the subagent's own cost. For per-model A/B testing, use `claude -p --model X` subprocesses instead — see [`research/per_model_cost_v3.md`](research/per_model_cost_v3.md) for the demonstration.
 - **Hooks aren't separately attributed.** Context they inject shows up in the next assistant turn's input count.
 - **The "days of subscription fee" line is informational** — it represents API-equivalent value extracted, not what you actually pay.
 - **Calibration needs ≥2 samples** spread across enough usage to see real movement. Anthropic's quota windows reset on a rolling basis; samples too close together may give noisy slopes.
