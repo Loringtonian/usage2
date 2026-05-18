@@ -1,6 +1,8 @@
 # Max 20x token budgets — front-and-center reference
 
-> **As of 2026-05-18.** Anthropic adjusts caps periodically; recalibrate when limits visibly shift. Derived from v3 experiment (`per_model_cost_v3.md`).
+> **As of 2026-05-18 (v4-refined).** Anthropic adjusts caps periodically; recalibrate when limits visibly shift. Derived from v3 + v4 experiments. Full methodology: [`per_model_cost_v4.md`](per_model_cost_v4.md).
+>
+> **What v4 added:** Opus's apparent 22% penalty was v3 noise (v4 deep-dive measured Opus at $0.545/pp). Cache state matters a lot (cold→hot 0.26–0.48× cost per model). Agent-tool tax characterized at ~11× ratio with an 80%-reduction workaround validated.
 
 ## TL;DR — how much can I do?
 
@@ -54,7 +56,19 @@ Multipliers: cache_write_5m = 1.25× input, cache_write_1h = 2× input, cache_re
 | Week (all models) 7d | **~$700** (provisional $525–$800) | Low — only 4pp panel movement during v3 |
 | Week (Sonnet only) 7d | **~$590** | Very low — only 1pp panel movement during v3 |
 
-Mild evidence of an Opus surcharge (~1.22×) — Opus measured at $0.823/pp vs Haiku/Sonnet average $0.666/pp. Either a real per-model multiplier or panel-resolution noise on the 11pp Opus stage.
+**No reproducible per-model multiplier.** v3 saw Opus 22% high; v4 saw Opus 17% low. Spread is panel-resolution noise (~25%). Treat all three models as ~$0.55–$0.72/pp for planning.
+
+### Cache state matters
+
+Cold vs hot cache changes per-call cost dramatically (v4 measurement):
+
+| Model | Cold $/call (15-call batch) | Hot $/call (15-call batch) | Hot/cold |
+|---|---|---|---|
+| Haiku 4.5 | $0.067 | $0.032 | **0.48×** |
+| Sonnet 4.6 | $0.160 | $0.072 | **0.45×** |
+| Opus 4.7 | $0.518 | $0.133 | **0.26×** |
+
+Plan Opus work in tight batches (within 5 minutes) to stack cache hits. Spreading Opus calls across hours gives up 3–4× cost.
 
 ### Solving for tokens-per-percent
 

@@ -1,0 +1,110 @@
+{
+  "version": 4,
+  "experiment_date": "2026-05-18",
+  "tier": "max20x",
+  "supersedes": [
+    "experiment_2026-05-18_v3.json"
+  ],
+  "phase_0_agent_tool_tax": {
+    "dispatches": 9,
+    "subagent_output_total": 33465,
+    "parent_cw1h_growth_total": 374168,
+    "tax_ratio": 11.18,
+    "tax_$_at_opus_cw1h_rate": 3.74,
+    "workaround_test": {
+      "subagent_return_tokens": 128,
+      "parent_cw1h_growth": 18716,
+      "reduction_vs_typical": 0.2,
+      "verdict": "viable mitigation - 80% reduction"
+    }
+  },
+  "phase_1_cache_state": {
+    "haiku_cold": {
+      "calls": 15,
+      "cost_usd": 0.9968,
+      "per_call": 0.0665,
+      "buckets": {
+        "in": 150,
+        "out": 42024,
+        "cr": 219916,
+        "cw1h": 604769
+      }
+    },
+    "haiku_hot": {
+      "calls": 15,
+      "cost_usd": 0.4808,
+      "per_call": 0.0321,
+      "buckets": {
+        "in": 158,
+        "out": 45418,
+        "cr": 769706,
+        "cw1h": 134377
+      }
+    },
+    "sonnet_cold": {
+      "calls": 10,
+      "cost_usd": 1.5974,
+      "per_call": 0.1597,
+      "buckets": {
+        "in": 37,
+        "out": 36632,
+        "cr": 437624,
+        "cw1h": 242864
+      }
+    },
+    "sonnet_hot": {
+      "calls": 10,
+      "cost_usd": 0.7224,
+      "per_call": 0.0722,
+      "buckets": {
+        "in": 35,
+        "out": 34339,
+        "cr": 596760,
+        "cw1h": 5968
+      }
+    },
+    "opus_cold": {
+      "calls": 5,
+      "cost_usd": 2.5916,
+      "per_call": 0.5183,
+      "buckets": {
+        "in": 30,
+        "out": 23989,
+        "cr": 0,
+        "cw1h": 318215
+      }
+    },
+    "opus_hot": {
+      "calls": 5,
+      "cost_usd": 0.6633,
+      "per_call": 0.1327,
+      "buckets": {
+        "in": 30,
+        "out": 20046,
+        "cr": 318215,
+        "cw1h": 0
+      }
+    },
+    "haiku_hot_cold_ratio": 0.483,
+    "sonnet_hot_cold_ratio": 0.452,
+    "opus_hot_cold_ratio": 0.256
+  },
+  "phase_2_opus_deep_dive": {
+    "batch_1": {
+      "calls": 10,
+      "cost_usd": 2.8513
+    },
+    "batch_2": {
+      "calls": 10,
+      "cost_usd": 2.5982
+    },
+    "combined": {
+      "calls": 20,
+      "cost_usd": 5.45,
+      "session_pp_delta": 10,
+      "dollars_per_pp": 0.545,
+      "note": "Lower than v3's $0.823/pp \u2014 v3 was noise"
+    }
+  },
+  "h1_verdict": "Holds within 25%. No consistent per-model multiplier across v3+v4 attempts."
+}

@@ -1,5 +1,7 @@
 # Per-model cost vs. panel-% — v3 (Max 20x, 2026-05-18)
 
+> **⚠ SUPERSEDED 2026-05-18 by v4.** See **[per_model_cost_v4.md](per_model_cost_v4.md)**. v3's headline numbers are still essentially correct ($72 session cap), but v3's claim of a 22% Opus penalty was panel-resolution noise — v4's 20-call Opus deep-dive measured $0.545/pp, actually *lower* than v3's Haiku/Sonnet baseline. v4 also characterizes the Agent-tool tax (~11× ratio) and shows that "write-to-file + short summary" reduces it by ~80%.
+
 **Supersedes:** [`per_model_cost.md`](per_model_cost.md) (v1) and [`per_model_cost_v2.md`](per_model_cost_v2.md). Both prior versions failed methodologically. v3 finally isolates per-model effects.
 
 **TL;DR:**
