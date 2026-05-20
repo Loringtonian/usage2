@@ -1,0 +1,167 @@
+{
+  "experiment": "v5 (v5-extended + follow-ups A & B)",
+  "date": "2026-05-19",
+  "tier": "Max 20x",
+  "method": "claude -p --output-format json subprocesses; /usage panel sampled via tmux before/after each batch; total_cost_usd and usage.* taken verbatim from each call's JSON stdout",
+  "session_window_hours": 5,
+  "panel_samples": {
+    "v5ext_baseline": {
+      "session_pct": 26,
+      "week_all_pct": 32,
+      "week_sonnet_pct": 18
+    },
+    "v5ext_after_haiku": {
+      "session_pct": 37,
+      "week_all_pct": 34,
+      "week_sonnet_pct": 18
+    },
+    "v5ext_after_sonnet": {
+      "session_pct": 50,
+      "week_all_pct": 36,
+      "week_sonnet_pct": 20
+    },
+    "v5ext_after_opus": {
+      "session_pct": 63,
+      "week_all_pct": 37,
+      "week_sonnet_pct": 20
+    },
+    "followup_B_pre": {
+      "session_pct": 4,
+      "week_all_pct": 38,
+      "week_sonnet_pct": 20
+    },
+    "followup_B_post": {
+      "session_pct": 6,
+      "week_all_pct": 38,
+      "week_sonnet_pct": 20
+    },
+    "followup_A_pre": {
+      "session_pct": 6,
+      "week_all_pct": 38,
+      "week_sonnet_pct": 20
+    },
+    "followup_A_post": {
+      "session_pct": 11,
+      "week_all_pct": 39,
+      "week_sonnet_pct": 20
+    }
+  },
+  "per_model": {
+    "haiku_4_5": {
+      "concurrency": "parallel=5",
+      "delta_session_pp": 11,
+      "delta_week_all_pp": 2,
+      "delta_week_sonnet_pp": 0,
+      "usd_per_pp": 0.443,
+      "data": {
+        "n_calls": 205,
+        "tokens": {
+          "input": 2050,
+          "output": 618085,
+          "cache_read": 12349088,
+          "cw1h": 340285,
+          "cw5m": 0
+        },
+        "anthropic_usd": 4.8716,
+        "per_call_mean_usd": 0.0238,
+        "per_call_sd_usd": 0.0111
+      }
+    },
+    "sonnet_4_6": {
+      "concurrency": "parallel=5",
+      "delta_session_pp": 13,
+      "delta_week_all_pp": 2,
+      "delta_week_sonnet_pp": 2,
+      "usd_per_pp": 0.464,
+      "data": {
+        "n_calls": 75,
+        "tokens": {
+          "input": 225,
+          "output": 299874,
+          "cache_read": 2851980,
+          "cw1h": 169190,
+          "cw5m": 0
+        },
+        "anthropic_usd": 6.032,
+        "per_call_mean_usd": 0.0804,
+        "per_call_sd_usd": 0.0322
+      }
+    },
+    "opus_4_7_parallel": {
+      "concurrency": "parallel=5",
+      "delta_session_pp": 13,
+      "delta_week_all_pp": 1,
+      "delta_week_sonnet_pp": 0,
+      "usd_per_pp": 0.639,
+      "data": {
+        "n_calls": 35,
+        "tokens": {
+          "input": 210,
+          "output": 170163,
+          "cache_read": 1717088,
+          "cw1h": 508467,
+          "cw5m": 0
+        },
+        "anthropic_usd": 8.3124,
+        "per_call_mean_usd": 0.2375,
+        "per_call_sd_usd": 0.1441
+      },
+      "note": "contaminated by parallel-race cw1h tax; superseded by opus_4_7_sequential"
+    },
+    "opus_4_7_sequential": {
+      "concurrency": "sequential=1",
+      "delta_session_pp": 5,
+      "delta_week_all_pp": 1,
+      "delta_week_sonnet_pp": 0,
+      "usd_per_pp": 0.499,
+      "data": {
+        "n_calls": 12,
+        "tokens": {
+          "input": 72,
+          "output": 59084,
+          "cache_read": 657634,
+          "cw1h": 108622,
+          "cw5m": 0
+        },
+        "anthropic_usd": 2.4923,
+        "per_call_mean_usd": 0.2077,
+        "per_call_sd_usd": 0.1205
+      },
+      "note": "clean measurement, no parallel-race tax"
+    }
+  },
+  "experiment_B_prompt_cache": {
+    "description": "4 sequential Haiku calls: PromptA, PromptA, PromptB(different), PromptB",
+    "calls": [
+      {
+        "call": 1,
+        "prompt": "A",
+        "cw1h": 62322,
+        "cache_read": 0,
+        "usd": 0.0929
+      },
+      {
+        "call": 2,
+        "prompt": "A",
+        "cw1h": 0,
+        "cache_read": 62322,
+        "usd": 0.0202
+      },
+      {
+        "call": 3,
+        "prompt": "B",
+        "cw1h": 25266,
+        "cache_read": 37042,
+        "usd": 0.0402
+      },
+      {
+        "call": 4,
+        "prompt": "B",
+        "cw1h": 0,
+        "cache_read": 62308,
+        "usd": 0.0116
+      }
+    ],
+    "finding": "changing the user prompt invalidates ~25K of the ~62K cached tokens; ~37K (Claude Code system prompt + tool definitions) remains cache-readable across user-prompt changes"
+  }
+}

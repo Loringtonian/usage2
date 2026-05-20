@@ -4,9 +4,9 @@ A Claude Code skill that gives the agent **visibility into its own token consump
 
 **For Claude Code subscription users** (Pro / Max 5x / Max 20x). The dollar figures it reports are *API-equivalent* — what the same tokens would have cost on metered API access. You actually pay the flat monthly subscription fee. The skill is built around making that gap visible: how much value you're extracting, where it's going, and how close you are to your tier's hard limits.
 
-> **📊 [Token budgets — how much can I do per session/week?](research/budgets.md)** Empirical caps + formulae + per-model token counts (Max 20x: ~$72 per 5h session, ~$700 per week). Recalibrate for your tier with `meter.py calibrate-account-scope`.
+> **📊 [Token budgets — how much can I do per session/week?](research/budgets.md)** Empirical caps + formulae + per-model token counts (Max 20x 5h session: ~$44 Haiku / ~$46 Sonnet / ~$50 Opus of API-equivalent value). Recalibrate for your tier with `meter.py calibrate-account-scope`.
 >
-> **🔬 Latest research:** [`per_model_cost_v4.md`](research/per_model_cost_v4.md) — Agent-tool tax characterized (~11×), workaround validated (~80% reduction), cache state shown to halve costs.
+> **🔬 Latest research:** [`per_model_cost_v5.md`](research/per_model_cost_v5.md) — per-model session caps measured at ≥10pp panel resolution, session cap mapped to token counts (incl. a 1:8 input:output projection), parallel-execution cost artifact isolated.
 
 Every quota capture writes a timestamped report to `reports/`. Subsequent runs read the whole history to learn your tier's tokens-per-percent empirically. You can crowdsource calibration via the partner skill **`/submit-usage2`** — it opens a PR adding your anonymized bundle to `crowd_reports/`. Other users pull from `crowd_reports/` to bootstrap their own calibration.
 
@@ -149,19 +149,19 @@ Each sample stores `(quota %, trailing-5h dollars, trailing-7d dollars)`. With �
 - **`calibrate`** uses *only* reports where the account was single-instance during sampling. Cleanest signal, but you may have zero usable reports if you typically run multiple Claude Code sessions.
 - **`calibrate-account-scope`** uses **all** chronologically-adjacent report pairs, including contaminated ones. Premise: panel %s reflect account-wide consumption, so account-scope dollars vs. account-scope panel-Δ is valid regardless of how many concurrent sessions ran. Strongly recommended if you run multiple sessions.
 
-**Empirical caps** (Max 20x on 2026-05-18) measured directly via `claude -p` subprocesses across three single-model stages. Full methodology: [`research/per_model_cost_v3.md`](research/per_model_cost_v3.md). v1 and v2 docs are SUPERSEDED.
+**Empirical caps** (Max 20x on 2026-05-19) measured directly via `claude -p` subprocesses, ≥10 percentage-points of panel resolution per model. Full methodology: [`research/per_model_cost_v5.md`](research/per_model_cost_v5.md). v1–v4 docs are SUPERSEDED.
 
-| Window | Haiku $/pp | Sonnet $/pp | Opus $/pp | Cap (3-model avg) |
-|---|---|---|---|---|
-| Session 5h | $0.675 | $0.656 | $0.823 | **~$72** |
+| Model      | $/pp   | Session 5h cap |
+|------------|--------|----------------|
+| Haiku 4.5  | $0.443 | ~$44           |
+| Sonnet 4.6 | $0.464 | ~$46           |
+| Opus 4.7   | $0.499 | ~$50           |
 
-Cross-model spread 22.6%. Haiku/Sonnet match within 3% — H1 (panel linear in API-$) supported. Opus runs 22% above the Haiku/Sonnet baseline — mild evidence of a small Opus penalty, or panel-resolution noise.
+The panel is approximately model-neutral — $/pp differs by at most 12.6% across the three models. Weekly caps are not yet measured (the v5 run moved the weekly windows only 2pp — too coarse).
 
-**Caveat — Agent tool tax:** subagent dispatches (foreground OR background via the Agent tool) inflate parent-side `cache_write_1h` at the parent's model rate. The subagent's own tokens are a minority of the total cost. For per-model comparisons, use `claude -p --model X` subprocesses instead. See v3 doc for details.
-| Week (all) 7d | $11.85 | ~$1,185 |
-| Week (Sonnet) 7d | $8.11 | ~$811 |
+**Caveat — Agent tool tax:** subagent dispatches (foreground OR background via the Agent tool) inflate parent-side `cache_write_1h` at the parent's model rate. The subagent's own tokens are a minority of the total cost. For per-model comparisons, use `claude -p --model X` subprocesses, run sequentially — parallel runs inflate cost via redundant cache writes. See the v5 doc for details.
 
-Full methodology: [`research/per_model_cost.md`](research/per_model_cost.md). Recalibrate when Anthropic adjusts caps.
+Recalibrate when Anthropic adjusts caps.
 
 ## Autonomous self-throttling pattern
 
@@ -224,4 +224,4 @@ MIT. See `LICENSE`.
 
 ## Background
 
-Built in May 2026 trying to settle a token-efficiency question on a Personal Media Archive project (biographical-detail subagents on photos: native-res vs 1024×1024?) and discovering the agent had no way to answer. v1 was a tmux scrape of the built-in `/usage` panel. v2 added per-action token attribution from the session transcript. v3 (current) adds API-equivalent dollar cost, per-tier framing, and passive calibration. The trick — that Claude Code already writes authoritative per-message usage blocks to local JSONL files — generalizes: any "give the agent visibility into something it currently can't see in Claude Code" problem probably has a similar local-file answer.
+Built in May 2026 trying to settle a token-efficiency question on a Personal Media Archive project (biographical-detail subagents on photos: native-res vs 1024×1024?) and discovering the agent had no way to answer. v1 was a tmux scrape of the built-in `/usage` panel. v2 added per-action token attribution from the session transcript. v3 added API-equivalent dollar cost, per-tier framing, and passive calibration. v3–v5 are empirical research rounds (`research/`) measuring the Max 20x tier's actual session caps directly via `claude -p` subprocesses. The trick — that Claude Code already writes authoritative per-message usage blocks to local JSONL files — generalizes: any "give the agent visibility into something it currently can't see in Claude Code" problem probably has a similar local-file answer.

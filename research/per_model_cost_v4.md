@@ -1,5 +1,7 @@
 # Per-model cost — v4 (Max 20x, 2026-05-18)
 
+> **⚠ SUPERSEDED 2026-05-19 by v5.** See **[per_model_cost_v5.md](per_model_cost_v5.md)**. v5 measures per-model session cost at ≥10pp of panel resolution (v4 had 1–4pp) and finds the session cap is ~$44–$50 per model, not the single ~$72 figure. v4's per-model numbers were distorted by a parallel-execution artifact: running `claude -p` calls concurrently inflates cost via redundant cache writes. v5 measures Opus sequentially and finds the panel is approximately model-neutral ($/pp within 12.6% across all three models).
+
 **Supersedes:** [v1](per_model_cost.md), [v2](per_model_cost_v2.md), [v3](per_model_cost_v3.md). v4 resolves three open questions from v3.
 
 ## TL;DR
