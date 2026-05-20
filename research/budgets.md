@@ -111,14 +111,16 @@ The two methods differ on whether the per-call ~62K-token system-prompt cache re
 If a session's entire cap went to one token bucket of one model:
 
 ```
-tokens_per_pp(model, bucket) = (session_cap × 10_000) / R_bucket
+tokens(model, bucket) = (session_cap × 1_000_000) / R_bucket
 ```
+
+(`R_bucket` is the published rate in $ per million tokens.)
 
 | Model      | Pure input | Pure output | Pure cache_read | Pure cache_write_1h |
 |------------|------------|-------------|-----------------|---------------------|
-| Haiku 4.5  | 440M       | 88M         | 4.4B            | 220M                |
-| Sonnet 4.6 | 153M       | 30.7M       | 1.53B           | 76.7M               |
-| Opus 4.7   | 100M       | 20M         | 1.0B            | 50M                 |
+| Haiku 4.5  | 44M        | 8.8M        | 440M            | 22M                 |
+| Sonnet 4.6 | 15.3M      | 3.07M       | 153M            | 7.67M               |
+| Opus 4.7   | 10M        | 2M          | 100M            | 5M                  |
 
 ---
 
