@@ -4,6 +4,8 @@ A Claude Code skill that gives the agent **visibility into its own token consump
 
 **For Claude Code subscription users** (Pro / Max 5x / Max 20x). The dollar figures it reports are *API-equivalent* — what the same tokens would have cost on metered API access. You actually pay the flat monthly subscription fee. The skill is built around making that gap visible: how much value you're extracting, where it's going, and how close you are to your tier's hard limits.
 
+**The point:** give a Claude Code agent the ability to **self-assess its own token efficiency, plan effective session usage, and make token spend predictable**. Monitoring — token counts, dollar cost, quota percentages — is the means; the end is an agent that can answer *"how much session budget is left"*, *"what will this action cost"*, and *"was approach A cheaper than approach B"* on its own, and act on the answer. The skill ships with empirically-measured per-model session budgets ([`research/per_model_cost_v5.md`](research/per_model_cost_v5.md)) so the agent has those numbers in context from the first invocation, before any calibration.
+
 > **📊 [Token budgets — how much can I do per session/week?](research/budgets.md)** Empirical caps + formulae + per-model token counts (Max 20x 5h session: ~$44 Haiku / ~$46 Sonnet / ~$50 Opus of API-equivalent value). Recalibrate for your tier with `meter.py calibrate-account-scope`.
 >
 > **🔬 Latest research:** [`per_model_cost_v5.md`](research/per_model_cost_v5.md) — per-model session caps measured at ≥10pp panel resolution, session cap mapped to token counts (incl. a 1:8 input:output projection), parallel-execution cost artifact isolated.

@@ -83,6 +83,69 @@ TIERS = {
     "max20x":  {"name": "Max 20x","monthly_fee_usd": 200},
 }
 
+# Empirical token-budget priors — measured, not calibrated. This is what a fresh
+# install knows before the user has taken any calibration samples, so an agent
+# running /usage2 can reason about its session budget immediately. Source:
+# research/per_model_cost_v5.md (Max 20x, measured 2026-05-19). Calibration
+# (≥2 `sample` runs) personalizes these and detects drift if Anthropic moves caps.
+# Per-pp = per 1 percentage-point of the /usage panel's 5h session window.
+EMPIRICAL_PRIORS = {
+    "max20x": {
+        "measured_date": "2026-05-19",
+        "source": "per_model_cost_v5.md",
+        "scaled_estimate": False,
+        "session": {
+            "claude-haiku-4-5": {
+                "usd_per_pp": 0.443, "cap_usd": 44,
+                "tokens_per_pp": {"input": 186, "output": 56190,
+                                  "cache_read": 1122644, "cache_write_1h": 30935},
+                "per_call_cold_usd": 0.096, "per_call_hot_usd": 0.024,
+            },
+            "claude-sonnet-4-6": {
+                "usd_per_pp": 0.464, "cap_usd": 46,
+                "tokens_per_pp": {"input": 17, "output": 23067,
+                                  "cache_read": 219383, "cache_write_1h": 13015},
+                "per_call_cold_usd": 0.212, "per_call_hot_usd": 0.080,
+            },
+            "claude-opus-4-7": {
+                "usd_per_pp": 0.499, "cap_usd": 50,
+                "tokens_per_pp": {"input": 14, "output": 11817,
+                                  "cache_read": 131527, "cache_write_1h": 21724},
+                "per_call_cold_usd": 0.540, "per_call_hot_usd": 0.238,
+            },
+        },
+    },
+}
+
+
+def _scaled_prior(base: dict, factor: float) -> dict:
+    """Linear-scale a measured tier prior by a monthly-fee ratio. A panel
+    percentage-point is 1% of the tier cap, so $/pp and tokens/pp both scale
+    with the cap. Per-call dollar cost is tier-independent (a call costs what it
+    costs; the tier sets how many fit)."""
+    out = {"measured_date": base["measured_date"], "source": base["source"],
+           "scaled_estimate": True, "session": {}}
+    for model, d in base["session"].items():
+        out["session"][model] = {
+            "usd_per_pp": round(d["usd_per_pp"] * factor, 4),
+            "cap_usd": round(d["cap_usd"] * factor, 1),
+            "tokens_per_pp": {k: round(v * factor) for k, v in d["tokens_per_pp"].items()},
+            "per_call_cold_usd": d["per_call_cold_usd"],
+            "per_call_hot_usd": d["per_call_hot_usd"],
+        }
+    return out
+
+# Pro / Max 5x are linear-scaled from the Max 20x measurement by monthly-fee
+# ratio — flagged scaled_estimate=True since they have not been measured directly.
+EMPIRICAL_PRIORS["max5x"] = _scaled_prior(EMPIRICAL_PRIORS["max20x"], 100 / 200)
+EMPIRICAL_PRIORS["pro"]   = _scaled_prior(EMPIRICAL_PRIORS["max20x"],  20 / 200)
+
+
+def empirical_prior(tier: str | None) -> dict:
+    """Return the empirical token-budget prior for a tier. Defaults to Max 20x
+    (the directly-measured tier) when tier is unset or unrecognized."""
+    return EMPIRICAL_PRIORS.get(tier or "max20x", EMPIRICAL_PRIORS["max20x"])
+
 # Skip "model" values that aren't real billable models
 SKIP_MODELS = {"<synthetic>", "synthetic", None, "", "unknown"}
 
@@ -409,17 +472,98 @@ def capture_quota_panel() -> str:
     return r.stdout
 
 
+def _parse_token_count(s: str) -> int:
+    """Parse panel-formatted token count: '447', '1.6k', '4.2m', '850.5k' → int."""
+    s = s.strip().lower().replace(",", "")
+    mult = 1
+    if s.endswith("k"): mult = 1_000; s = s[:-1]
+    elif s.endswith("m"): mult = 1_000_000; s = s[:-1]
+    elif s.endswith("b"): mult = 1_000_000_000; s = s[:-1]
+    try: return int(float(s) * mult)
+    except: return 0
+
+
 def parse_quota_panel(text: str) -> dict:
+    """Parse Claude Code /usage panel text, including rich diagnostic blocks.
+
+    Returns base percentage/reset fields (compat), plus enriched fields:
+    - panel_session_total_cost_usd, panel_session_duration_api/wall, panel_session_code_changes
+    - panel_session_by_model: {model: {input, output, cache_read, cache_write, dollars}}
+    - panel_contributing_factors: {factor_label: pct_int}
+    - panel_skills_pct, panel_subagents_pct: {name: pct_int}
+    - panel_extra_usage_enabled: bool
+    """
     out = {"session_pct": None, "session_reset": None,
            "week_all_pct": None, "week_reset": None,
-           "week_sonnet_pct": None, "week_sonnet_reset": None}
+           "week_sonnet_pct": None, "week_sonnet_reset": None,
+           "panel_session_total_cost_usd": None,
+           "panel_session_duration_api": None,
+           "panel_session_duration_wall": None,
+           "panel_session_code_changes": None,
+           "panel_session_by_model": {},
+           "panel_contributing_factors": {},
+           "panel_skills_pct": {},
+           "panel_subagents_pct": {},
+           "panel_extra_usage_enabled": None}
     section = None
+    in_contrib_block = False
+    table_mode = None  # None | "skills" | "subagents"
+
     for line in text.splitlines():
         s = line.strip()
-        if "Current session" in s: section = "session"
+
+        # Section detection
+        # Note: the panel has TWO different "session" contexts:
+        # 1. "Session" header block (Total cost, Duration, Code changes, Usage by model)
+        # 2. "Current session" block (percentage + reset time)
+        if s == "Session" or s.startswith("Session  "):
+            section = "session_header"
+        elif "Current session" in s: section = "session"
         elif "Current week (all models)" in s: section = "week_all"
         elif "Current week (Sonnet only)" in s: section = "week_sonnet"
-        elif s.startswith("What's contributing") or s.startswith("Extra usage"): section = None
+        elif s.startswith("What's contributing"):
+            section = None
+            in_contrib_block = True
+        elif s.startswith("Extra usage"):
+            section = None
+            in_contrib_block = False
+            # Detect enabled/disabled state
+            if "not enabled" in s.lower():
+                out["panel_extra_usage_enabled"] = False
+            elif "enabled" in s.lower():
+                out["panel_extra_usage_enabled"] = True
+
+        # Session header block: Total cost / Duration / Code changes / Usage by model
+        if section in ("session_header", "session"):
+            m = re.search(r"Total cost:\s*\$([\d.]+)", s)
+            if m and out.get("panel_session_total_cost_usd") is None:
+                try: out["panel_session_total_cost_usd"] = float(m.group(1))
+                except: pass
+            m = re.search(r"Total duration \(API\):\s*(.+?)\s*$", s)
+            if m and not out.get("panel_session_duration_api"):
+                out["panel_session_duration_api"] = m.group(1).strip()
+            m = re.search(r"Total duration \(wall\):\s*(.+?)\s*$", s)
+            if m and not out.get("panel_session_duration_wall"):
+                out["panel_session_duration_wall"] = m.group(1).strip()
+            m = re.search(r"Total code changes:\s*(\d+)\s*lines? added,\s*(\d+)\s*lines? removed", s)
+            if m and not out.get("panel_session_code_changes"):
+                out["panel_session_code_changes"] = {
+                    "lines_added": int(m.group(1)),
+                    "lines_removed": int(m.group(2))
+                }
+            # "Usage by model:" block — per-model breakdown
+            #  Example: "claude-opus-4-7:  1.6k input, 26.8k output, 4.2m cache read, 850.5k cache write ($8.10)"
+            m = re.match(r"^(claude-[\w.-]+):\s*([\d.]+[kmb]?)\s*input,\s*([\d.]+[kmb]?)\s*output,\s*([\d.]+[kmb]?)\s*cache read,\s*([\d.]+[kmb]?)\s*cache write\s*\(\$([\d.]+)\)", s, re.IGNORECASE)
+            if m:
+                out["panel_session_by_model"][m.group(1)] = {
+                    "input": _parse_token_count(m.group(2)),
+                    "output": _parse_token_count(m.group(3)),
+                    "cache_read": _parse_token_count(m.group(4)),
+                    "cache_write": _parse_token_count(m.group(5)),
+                    "dollars": float(m.group(6))
+                }
+
+        # Existing percentage extraction
         m = re.search(r"(\d+)%\s*used", s)
         if m and section and out.get(f"{section}_pct") is None:
             out[f"{section}_pct"] = int(m.group(1))
@@ -427,6 +571,37 @@ def parse_quota_panel(text: str) -> dict:
         if m2 and section:
             key = "session_reset" if section == "session" else "week_reset" if section == "week_all" else "week_sonnet_reset"
             if out.get(key) is None: out[key] = m2.group(1).strip()
+
+        # "What's contributing" block: each factor is a "  NN% of your usage..." line
+        if in_contrib_block:
+            # Table mode for Skills / Subagents
+            if re.match(r"^Skills\s+%\s*of usage", s):
+                table_mode = "skills"
+                continue
+            if re.match(r"^Subagents\s+%\s*of usage", s):
+                table_mode = "subagents"
+                continue
+            # End of contributing block (next major section)
+            if s.startswith("d to day") or s.startswith("Extra usage") or s.startswith("Esc to cancel"):
+                in_contrib_block = False
+                table_mode = None
+                continue
+            # Factor line: "  66% of your usage was while 4+ sessions ran in parallel"
+            if table_mode is None:
+                m = re.match(r"^(\d+)%\s*of your usage\s*(.+?)(?:\s*$|\.)", s)
+                if m:
+                    pct = int(m.group(1))
+                    factor = m.group(2).strip()
+                    # Normalize the key
+                    key = re.sub(r'\s+', '_', factor.lower())[:50]
+                    out["panel_contributing_factors"][key] = pct
+            # Skills/Subagents table rows: "  /commit-force    1%" or "  general-purpose   1%"
+            elif table_mode in ("skills", "subagents"):
+                m = re.match(r"^([\S/-]+)\s+(\d+)%\s*$", s)
+                if m:
+                    target = "panel_skills_pct" if table_mode == "skills" else "panel_subagents_pct"
+                    out[target][m.group(1)] = int(m.group(2))
+
     return out
 
 
@@ -474,6 +649,12 @@ def refresh_quota(force: bool = False, write_report: bool = True, jsonl: Path | 
                 "panel": {k: parsed.get(k) for k in
                           ("session_pct", "session_reset", "week_all_pct", "week_reset",
                            "week_sonnet_pct", "week_sonnet_reset")},
+                "panel_enriched": {k: parsed.get(k) for k in
+                          ("panel_session_total_cost_usd", "panel_session_duration_api",
+                           "panel_session_duration_wall", "panel_session_code_changes",
+                           "panel_session_by_model", "panel_contributing_factors",
+                           "panel_skills_pct", "panel_subagents_pct",
+                           "panel_extra_usage_enabled")},
                 "trailing_5h": {**account_5h, "session_scope": session_5h},
                 "trailing_7d": {**account_7d, "session_scope": session_7d},
                 "concurrent_5h": [p.stem for p in others_5h],
@@ -822,6 +1003,31 @@ def report_summary(jsonl: Path, byte_offset: int = 0, label: str = "",
             print(f"  ({age_str})")
         print()
 
+    # ── Token budget — empirical prior; prints even with zero calibration ──
+    prior = empirical_prior(tier)
+    pname = TIERS.get(tier or "max20x", TIERS["max20x"])["name"]
+    scaled = "  [scaled estimate — not measured for this tier]" if prior.get("scaled_estimate") else ""
+    print(f"### Token budget — {pname} empirical prior (measured {prior['measured_date']}){scaled}")
+    for label, key in (("Haiku 4.5", "claude-haiku-4-5"),
+                       ("Sonnet 4.6", "claude-sonnet-4-6"),
+                       ("Opus 4.7", "claude-opus-4-7")):
+        d = prior["session"][key]; t = d["tokens_per_pp"]
+        print(f"  {label:<11} session cap ~${d['cap_usd']:.0f}  ·  {fmt_dollars(d['usd_per_pp'])}/pp  "
+              f"·  per pp ≈ {fmt(t['output'])} output + {fmt(t['cache_read'])} cache-read tok")
+    sess_pct = (load_quota_cache() or {}).get("session_pct")
+    if sess_pct is not None:
+        rem = 100 - sess_pct
+        worth = " / ".join(
+            f"~${prior['session'][k]['usd_per_pp'] * rem:.0f} {lbl}"
+            for lbl, k in (("Haiku", "claude-haiku-4-5"),
+                           ("Sonnet", "claude-sonnet-4-6"),
+                           ("Opus", "claude-opus-4-7")))
+        print(f"  Headroom: {rem}pp of session left  →  {worth} of API-equivalent work")
+    print(f"  Controlled measurement (research/per_model_cost_v5.md). The Calibration block")
+    print(f"  below derives $/pp from your own report history — noisier; when the two differ,")
+    print(f"  trust this controlled prior. `usage2 budget` for the full per-bucket table.")
+    print()
+
     est = calibration_estimates(include_crowd=include_crowd, tier_filter=tier)
     all_reports = load_reports(include_crowd=include_crowd)
     clean = sum(1 for r in all_reports if r.get("contaminated") is False)
@@ -886,8 +1092,12 @@ def report_quick(jsonl: Path):
     q = load_quota_cache() or {}
     sess = f"sess {q.get('session_pct')}%" if q.get("session_pct") is not None else "sess ?"
     week = f"week {q.get('week_all_pct')}%" if q.get("week_all_pct") is not None else "week ?"
+    prior = empirical_prior(load_config().get("tier"))
+    caps = [prior["session"][k]["cap_usd"]
+            for k in ("claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-7")]
+    cap = f"cap ~${min(caps):.0f}-{max(caps):.0f}"
     print(f"{fmt(grand)} tok ({fmt(nt)} new) · {fmt_dollars(total_cost)} · "
-          f"{m['turns']} turns · subs {len(subs)} · cache {cache_hit_pct(m):.0f}% · {sess} · {week}")
+          f"{m['turns']} turns · subs {len(subs)} · cache {cache_hit_pct(m):.0f}% · {sess} · {week} · {cap}")
 
 
 def report_agents(jsonl: Path):
@@ -903,6 +1113,42 @@ def report_agents(jsonl: Path):
               f"({fmt(s['input_tokens'])} in / {fmt(s['output_tokens'])} out / {fmt(s['cache_read_input_tokens'])} cache-r)  "
               f"{s['durationMs']/1000:.1f}s · {s['toolUseCount']} tools")
         print(f"   \"{s['prompt_preview']}…\"")
+
+
+def report_budget():
+    """Print the empirical token-budget prior for the active tier — what a
+    session/week is worth in dollars and tokens. No quota scrape, no JSONL."""
+    cfg = load_config()
+    tier = cfg.get("tier")
+    prior = empirical_prior(tier)
+    pname = TIERS.get(tier or "max20x", TIERS["max20x"])["name"]
+    if tier is None:
+        print("(tier not set — assuming Max 20x; run `usage2 tier <pro|max5x|max20x>` to set)")
+    print(f"## usage2 token budget — {pname}")
+    note = "  ·  SCALED ESTIMATE — not measured for this tier" if prior.get("scaled_estimate") else ""
+    print(f"## Empirical prior, measured {prior['measured_date']} (source: {prior['source']}){note}")
+    print()
+    print("Session 5h cap, single-model strategy (1 pp = 1% of the /usage panel):")
+    print(f"  {'Model':<12}{'cap $':>8}{'$/pp':>9}{'input/pp':>11}{'output/pp':>12}"
+          f"{'cache_read/pp':>15}{'cw1h/pp':>10}")
+    for label, key in (("Haiku 4.5", "claude-haiku-4-5"),
+                       ("Sonnet 4.6", "claude-sonnet-4-6"),
+                       ("Opus 4.7", "claude-opus-4-7")):
+        d = prior["session"][key]; t = d["tokens_per_pp"]
+        print(f"  {label:<12}{'$' + format(d['cap_usd'], '.0f'):>8}{fmt_dollars(d['usd_per_pp']):>9}"
+              f"{fmt(t['input']):>11}{fmt(t['output']):>12}{fmt(t['cache_read']):>15}"
+              f"{fmt(t['cache_write_1h']):>10}")
+    print()
+    print("Per-call cost (2000-word generation, ~62K-token cached prefix):")
+    for label, key in (("Haiku 4.5", "claude-haiku-4-5"),
+                       ("Sonnet 4.6", "claude-sonnet-4-6"),
+                       ("Opus 4.7", "claude-opus-4-7")):
+        d = prior["session"][key]
+        print(f"  {label:<12} cold {fmt_dollars(d['per_call_cold_usd'])}  ·  "
+              f"hot {fmt_dollars(d['per_call_hot_usd'])}")
+    print()
+    print("The /usage panel is approximately model-neutral ($/pp within ~13% across models).")
+    print("These are priors — run `usage2 sample` twice to calibrate against your own account.")
 
 
 def save_mark(name: str, jsonl: Path, capture_quota: bool = False):
@@ -1076,7 +1322,6 @@ def cmd_estimate(args):
     tier = cfg.get("tier")
     reports = load_reports(include_crowd=False)
     slopes = account_scope_slopes(reports, tier_filter=tier)
-    fallback_defaults = {"max20x": 1.73, "max5x": 0.85, "pro": 0.40}
     sess = slopes.get("session_5h")
     week = slopes.get("week_all")
     son = slopes.get("week_sonnet")
@@ -1085,7 +1330,11 @@ def cmd_estimate(args):
     son_per_pp = son["median"] if son else None
     used_default = False
     if sess_per_pp is None:
-        sess_per_pp = fallback_defaults.get(tier, fallback_defaults["max20x"])
+        # No calibration yet — fall back to the v5 empirical prior for this
+        # model (research/per_model_cost_v5.md), not a hand-picked constant.
+        prior = empirical_prior(tier)
+        msess = prior["session"].get(normalize_model_name(model))
+        sess_per_pp = (msess or prior["session"]["claude-sonnet-4-6"])["usd_per_pp"]
         used_default = True
 
     sess_pp = dollars / sess_per_pp if sess_per_pp else 0
@@ -1094,7 +1343,7 @@ def cmd_estimate(args):
 
     print(f"Cost estimate for {fmt(tokens)} tokens of {model} ({bucket}):")
     print(f"  API-equivalent: {fmt_dollars(dollars)}")
-    print(f"  Session 5h:     ~{sess_pp:.1f}%" + ("  (no calibration data; using default)" if used_default else ""))
+    print(f"  Session 5h:     ~{sess_pp:.1f}%" + ("  (no calibration; using v5 empirical prior, measured 2026-05-19)" if used_default else ""))
     if week_pp is not None:
         print(f"  Week (all):     ~{week_pp:.1f}%")
     if son_pp is not None and model.startswith("claude-sonnet"):
@@ -1199,6 +1448,8 @@ def main():
         cmd_reports(); return
     if mode == "reset-calibration":
         cmd_reset_calibration(); return
+    if mode == "budget":
+        report_budget(); return
 
     jsonl = current_session_jsonl()
     if not jsonl and mode not in ("marks", "drop", "quota", "sample"):

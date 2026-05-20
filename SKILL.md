@@ -8,11 +8,27 @@ allowed-tools: Bash
 
 For **Claude subscription users** (Pro / Max 5x / Max 20x). The dollar figures are *API-equivalent* (what you would have paid on metered API). You actually pay the flat subscription fee.
 
+**Why this exists:** so the agent can *self-assess its own token efficiency, plan effective session usage, and make token spend predictable* — not just watch a number climb. With this skill the agent can answer "how much session budget is left", "what will this action cost", and "is approach A cheaper than approach B" without the user babysitting a panel.
+
 Three capabilities in one skill:
 
 1. **Token meter** (~10ms) — reads the session transcript JSONL and reports authoritative per-action token consumption, API-equivalent dollar cost, cache breakdown, per-subagent attribution.
 2. **Quota panel** (~12s, cached for 10 min) — captures Claude Code's built-in `/usage` panel via tmux for rolling 5h / 7d / Sonnet-only meters with reset times.
 3. **Calibration** — learns your tier's tokens-per-percent passively from each `quota` capture. After 2+ samples you can estimate "this 50K-token action will be ~X% of my session."
+
+## Token budgets (Max 20x, measured 2026-05-19)
+
+Empirical priors so the agent can reason about budget immediately — before any calibration. One 5-hour session window at 100% panel saturation, single-model strategy:
+
+| Model      | Session cap | $/pp   | output tokens/pp | cache_read tokens/pp |
+|------------|-------------|--------|------------------|----------------------|
+| Haiku 4.5  | ~$44        | $0.443 | 56,190           | 1,122,644            |
+| Sonnet 4.6 | ~$46        | $0.464 | 23,067           | 219,383              |
+| Opus 4.7   | ~$50        | $0.499 | 11,817           | 131,527              |
+
+`pp` = 1 percentage-point of the `/usage` session window. The panel is approximately model-neutral — $/pp differs by at most ~13% across models. Per-call cost (2000-word generation over a ~62K-token cached prefix): cold $0.10 / $0.21 / $0.54, hot $0.02 / $0.08 / $0.24 for Haiku / Sonnet / Opus.
+
+These are priors (Max 20x measured directly; Pro and Max 5x are linearly scaled, untested) and hold until Anthropic changes limits. `meter.py budget` prints the full per-bucket table; `meter.py sample` twice calibrates against your own account. Full methodology: `research/per_model_cost_v5.md`.
 
 ## First-time setup
 
@@ -46,6 +62,7 @@ Modes:
 | `calibrate`         | Show calibration history + derived tokens-per-percent estimates  | ~1ms   |
 | `calibrate-account-scope` | Consecutive-pair $/pp slopes from short-interval samples   | ~1ms   |
 | `estimate` `--model <m> --tokens <N>` | $ + est. session/week % impact for a planned action | ~1ms   |
+| `budget`            | Empirical session token budget for your tier (caps, $/pp, tokens/pp) | ~1ms   |
 | `reset-calibration` | Archive all reports to `reports_archive/<timestamp>/`            | ~10ms  |
 | `tier [<t>]`        | Show or set subscription tier (pro / max5x / max20x)             | ~1ms   |
 
@@ -106,7 +123,7 @@ Anthropic doesn't publish exact per-tier token caps — calibration is how `usag
 
 - **The current in-flight turn isn't yet in the JSONL.** Claude Code writes assistant messages after the turn completes. The meter is always one turn behind.
 - **Subagents are aggregated, not per-step.** `toolUseResult.totalTokens` gives the full cost of a subagent dispatch, but the parent transcript doesn't include the subagent's internal turn-by-turn detail. Subagent costs assume a model per `agentType` (see `AGENT_TYPE_MODEL` in `meter.py`).
-- **Agent-tool tax (per-model isolation impossible via subagents).** Every Agent dispatch — foreground OR background — writes the subagent's return into the parent's next-turn `cache_write_1h` at the parent's model rate (Opus, for interactive sessions). The displayed subagent cost is only the subagent's own tokens; the parent-side amplification is typically 10–30× more and shows up in the main-thread total. **For per-model A/B testing, use `claude -p --model X` subprocesses, not the Agent tool.** Demonstrated empirically in research/per_model_cost_v5.md.
+- **Agent-tool tax (per-model isolation impossible via subagents).** Every Agent dispatch — foreground OR background — writes the subagent's return into the parent's next-turn `cache_write_1h` at the parent's model rate (Opus, for interactive sessions). The displayed subagent cost is only the subagent's own tokens; the parent-side amplification is typically 10–30× more and shows up in the main-thread total. **For per-model A/B testing, use `claude -p --model X` subprocesses, not the Agent tool — run them sequentially, since parallel runs inflate cost via redundant cache writes.** Demonstrated empirically in research/per_model_cost_v5.md.
 - **Background subagents are invisible to `agents` mode.** `run_in_background: true` Agent dispatches don't write `toolUseResult.totalTokens` to the parent JSONL. They still consume quota (the panel ticks) but `/usage2 agents` can't see them. Use foreground dispatch when you need per-spawn attribution.
 - **Date-suffixed model names (e.g., `claude-haiku-4-5-20251001`) fall back to Sonnet pricing.** `claude -p` subprocesses sometimes write the full versioned model ID into their JSONL. The meter's `rates_for()` does a strict dict lookup and falls back to `DEFAULT_RATE_KEY` (Sonnet) for unknown keys, mis-attributing Haiku cost as Sonnet (3× higher). When using `claude -p` for measurement, trust the subprocess's stdout `total_cost_usd` directly — that's Anthropic's billing source of truth.
 - **Hooks aren't separately attributed.** PostToolUse / PreCompact hooks that inject context show up in the next assistant turn's input count, not as their own line.
